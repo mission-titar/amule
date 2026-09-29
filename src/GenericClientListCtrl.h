@@ -199,6 +199,7 @@ private:
 
 	// Event-handlers for clients.
 	void OnSwapSource(wxCommandEvent &event);
+	void OnForcePartSource(wxCommandEvent &event);
 	void OnViewFiles(wxCommandEvent &event);
 	void OnAddFriend(wxCommandEvent &event);
 	void OnSetFriendslot(wxCommandEvent &event);

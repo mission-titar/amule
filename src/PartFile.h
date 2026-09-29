@@ -155,6 +155,8 @@ public:
 
 	bool GetNextRequestedBlock(
 		CUpDownClient *sender, std::vector<Requested_Block_Struct *> &toadd, uint16 &count);
+	/// Reapply the current forced-part restriction to already active download sources.
+	void ApplyForcedPartSelection();
 	void WritePartStatus(CMemFile *file);
 	void WriteCompleteSourcesCount(CMemFile *file);
 	static bool CanAddSource(uint32 userid,

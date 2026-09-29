@@ -75,6 +75,7 @@
 #include "FileArea.h"             // Needed for CFileArea
 #include "ScopedPtr.h"            // Needed for CScopedArray
 #include "CorruptionBlackBox.h"
+#include "ForcePartSelection.h"
 
 #include "kademlia/kademlia/Kademlia.h"
 #include "kademlia/kademlia/Search.h"
@@ -2127,6 +2128,52 @@ void CPartFile::UpdatePartsInfo()
 	UpdateDisplayedInfo();
 }
 
+// Reapply the forced-part restriction to sources which are already downloading this file.
+// This is deliberately done without stopping the partfile: the current request pipeline is
+// cancelled and rebuilt against the new restriction immediately.
+void CPartFile::ApplyForcedPartSelection()
+{
+	for (SourceSet::iterator it = m_SrcList.begin(); it != m_SrcList.end(); ++it) {
+		CUpDownClient *client = it->GetClient();
+		if (client == NULL || client->GetRequestFile() != this) {
+			continue;
+		}
+
+		client->SetLastPartAsked(0xffff);
+
+		const bool wasDownloading = (client->GetDownloadState() == DS_DOWNLOADING);
+		if (!wasDownloading &&
+				client->GetDownloadState() != DS_ONQUEUE &&
+				client->GetDownloadState() != DS_NONEEDEDPARTS) {
+			continue;
+		}
+
+		// Cancel an active transfer, but do not immediately send OP_STARTUPLOADREQ again.
+		// The remote client applies an anti-aggressive-request check to file requests.
+		// Keep the existing LastAskedTime so the normal source reask scheduler decides
+		// when another request is allowed. This deliberately avoids ResetLastAskedTime()
+		// and SendStartupLoadReq() here.
+		if (wasDownloading && !client->GetSentCancelTransfer()) {
+			CPacket *packet = new CPacket(OP_CANCELTRANSFER, 0, OP_EDONKEYPROT);
+			theStats::AddUpOverheadFileRequest(packet->GetPacketSize());
+			client->SendPacket(packet, true, true);
+			client->SetSentCancelTransfer(true);
+		}
+
+		// If a transfer was active, leave the source in the normal queue state.
+		// SetDownloadState() clears the in-flight block requests, but it does not reset
+		// LastAskedTime(). The normal source scheduler will therefore respect the existing
+		// reask interval before sending another OP_STARTUPLOADREQ.
+		//
+		// If the source is already DS_NONEEDEDPARTS, leave that state untouched. Its normal
+		// scheduler deliberately waits twice the source reask interval before rechecking it.
+		if (wasDownloading) {
+			client->SetDownloadState(DS_ONQUEUE);
+		}
+		client->SetSentCancelTransfer(false);
+	}
+}
+
 // [Maella -Enhanced Chunk Selection- (based on jicxicmic)]
 bool CPartFile::GetNextRequestedBlock(
 	CUpDownClient *sender, std::vector<Requested_Block_Struct *> &toadd, uint16 &count)
@@ -2179,20 +2226,26 @@ bool CPartFile::GetNextRequestedBlock(
 	while (newBlockCount != count) {
 		// Create a request block structure if a chunk has been previously selected
 		if (sender->GetLastPartAsked() != 0xffff) {
-			Requested_Block_Struct *pBlock = new Requested_Block_Struct;
-			if (GetNextEmptyBlockInPart(sender->GetLastPartAsked(), pBlock) == true) {
-				// Keep a track of all pending requested blocks
-				m_requestedblocks_list.push_back(pBlock);
-				// Update list of blocks to return
-				toadd.push_back(pBlock);
-				newBlockCount++;
-				// Skip end of loop (=> CPU load)
-				continue;
-			} else {
-				// All blocks for this chunk have been already requested
-				delete pBlock;
-				// => Try to select another chunk
+			if (!ForcePartSelection::IsAllowed(GetFileHash(), sender->GetLastPartAsked()) ||
+				!ForcePartSelection::IsSourceAllowed(
+					GetFileHash(), sender->GetLastPartAsked(), sender->GetUserHash())) {
 				sender->SetLastPartAsked(0xffff);
+			} else {
+				Requested_Block_Struct *pBlock = new Requested_Block_Struct;
+				if (GetNextEmptyBlockInPart(sender->GetLastPartAsked(), pBlock) == true) {
+					// Keep a track of all pending requested blocks
+					m_requestedblocks_list.push_back(pBlock);
+					// Update list of blocks to return
+					toadd.push_back(pBlock);
+					newBlockCount++;
+					// Skip end of loop (=> CPU load)
+					continue;
+				} else {
+					// All blocks for this chunk have been already requested
+					delete pBlock;
+					// => Try to select another chunk
+					sender->SetLastPartAsked(0xffff);
+				}
 			}
 		}
 
@@ -2203,6 +2256,10 @@ bool CPartFile::GetNextRequestedBlock(
 			if (chunksList.empty()) {
 				// Identify the locally missing part(s) that this source has
 				for (uint16 i = 0; i < partCount; ++i) {
+					if (!ForcePartSelection::IsAllowed(GetFileHash(), i) ||
+						!ForcePartSelection::IsSourceAllowed(GetFileHash(), i, sender->GetUserHash())) {
+						continue;
+					}
 					if (sender->IsPartAvailable(i) == true &&
 						GetNextEmptyBlockInPart(i, NULL) == true) {
 						// Create a new entry for this chunk and add it to the list

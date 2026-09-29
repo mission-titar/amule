@@ -1,0 +1,202 @@
+===== ForcePartSelection.h =====
+//
+// This file is part of the aMule Project.
+//
+// Temporary command-line restriction for downloading one part of one file.
+//
+
+#ifndef FORCE_PART_SELECTION_H
+#define FORCE_PART_SELECTION_H
+
+#include "MD4Hash.h"
+
+namespace ForcePartSelection {
+
+//! Select exactly one part of one file for download.
+void Set(const CMD4Hash &fileHash, uint32 part);
+
+//! Disable the forced-part restriction.
+void Clear();
+
+//! Return true when the given file/part is allowed to be requested.
+bool IsAllowed(const CMD4Hash &fileHash, uint32 part);
+
+} // namespace ForcePartSelection
+
+#endif // FORCE_PART_SELECTION_H
+===== ForcePartSelection.cpp =====
+//
+// This file is part of the aMule Project.
+//
+// Temporary command-line restriction for downloading one part of one file.
+//
+
+#include "ForcePartSelection.h"
+
+namespace {
+CMD4Hash s_fileHash;
+uint32 s_part = 0;
+bool s_active = false;
+} // namespace
+
+namespace ForcePartSelection {
+
+void Set(const CMD4Hash &fileHash, uint32 part)
+{
+	s_fileHash = fileHash;
+	s_part = part;
+	s_active = true;
+}
+
+void Clear()
+{
+	s_fileHash.Clear();
+	s_part = 0;
+	s_active = false;
+}
+
+bool IsAllowed(const CMD4Hash &fileHash, uint32 part)
+{
+	return !s_active || (fileHash == s_fileHash && part == s_part);
+}
+
+} // namespace ForcePartSelection
+===== amuleAppCommon.cpp =====
+	// Change webserver path. This is also a config option, so this switch will go at some time.
+	cmdline.AddOption("w", "use-amuleweb", "Specify location of amuleweb binary.");
+#endif
+#ifndef __WINDOWS__
+	cmdline.AddSwitch("d",
+		"disable-fatal",
+		"Don't catch fatal exceptions or block exit on assertions "
+		"(useful under systemd / watchdog scripts).");
+	// Keep stdin open to run valgrind --gen_suppressions
+	cmdline.AddSwitch("i", "enable-stdin", "Do not disable stdin.");
+#endif
+
+	cmdline.AddOption("t", "category", "Set category for passed ED2K links.", wxCMD_LINE_VAL_NUMBER);
+	cmdline.AddOption("", "force-part",
+		"Only request one part of one file: <ed2k-hash>:<part-number>.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddParam(
+		"ED2K link", wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL | wxCMD_LINE_PARAM_MULTIPLE);
+
+	// wx asserts in debug mode if there is a check for an option that wasn't added.
+	// So we have to wrap around the same #ifdefs as above. >:(
+
+	// Show help on --help or invalid commands
+	if (cmdline.Parse()) {
+		return false;
+	} else if (cmdline.Found("help")) {
+		cmdline.Usage();
+		return false;
+	}
+
+	if (cmdline.Found("version")) {
+		// This looks silly with logging macros that add a timestamp.
+		printf("%s\n",
+			(const char *)unicode2char(
+				wxString(CFormat("%s (OS: %s)") % FullMuleVersion % OSType)));
+		return false;
+	}
+
+
+	wxString forcePartArg;
+	if (cmdline.Found("force-part", &forcePartArg)) {
+		const int separator = forcePartArg.Find(':', true);
+		if (separator <= 0 || separator >= static_cast<int>(forcePartArg.length()) - 1) {
+			fprintf(stderr, "--force-part expects <ed2k-hash>:<part-number>\n");
+			return false;
+		}
+
+		const wxString hashText = forcePartArg.Left(separator);
+		const wxString partText = forcePartArg.Mid(separator + 1);
+		CMD4Hash fileHash;
+		long partNumber = -1;
+		if (!fileHash.Decode(hashText) || !partText.ToLong(&partNumber) ||
+			partNumber < 0 || partNumber >= 0xffff) {
+			fprintf(stderr,
+				"--force-part expects a valid 32-character ED2K hash and a part number from 0 to 65534\n");
+			return false;
+		}
+
+		ForcePartSelection::Set(fileHash, static_cast<uint32>(partNumber));
+		AddLogLineNS(CFormat(LOG_PRELOCALE("Forced download part: %s:%u\n")) % hashText %
+			static_cast<unsigned>(partNumber));
+	}
+
+	wxString autostart_arg;
+	if (cmdline.Found("configure-autostart", &autostart_arg)) {
+		autostart_arg.MakeLower();
+		bool ok = false;
+		if (autostart_arg == wxT("on") || autostart_arg == wxT("yes") ||
+			autostart_arg == wxT("true") || autostart_arg == wxT("1")) {
+			ok = AutostartManager::Enable();
+			printf(ok ? "autostart enabled\n" : "autostart enable FAILED\n");
+		} else if (autostart_arg == wxT("off") || autostart_arg == wxT("no") ||
+			   autostart_arg == wxT("false") || autostart_arg == wxT("0")) {
+			ok = AutostartManager::Disable();
+			printf(ok ? "autostart disabled\n" : "autostart disable FAILED\n");
+		} else {
+			fprintf(stderr,
+				"configure-autostart expects 'on' or 'off' (got '%s')\n",
+				(const char *)unicode2char(autostart_arg));
+		}
+		// Exit either way: this flag is a one-shot toggle, not a "run aMule WITH autostart
+===== PartFile.cpp =====
+	// Check input parameters
+	if (sender->GetPartStatus().empty()) {
+		return false;
+	}
+	// Define and create the list of the chunks to download
+	const uint16 partCount = GetPartCount();
+	ChunkList chunksList;
+
+	// Main loop
+	uint16 newBlockCount = 0;
+	while (newBlockCount != count) {
+		// Create a request block structure if a chunk has been previously selected
+		if (sender->GetLastPartAsked() != 0xffff) {
+			if (!ForcePartSelection::IsAllowed(GetFileHash(), sender->GetLastPartAsked())) {
+				sender->SetLastPartAsked(0xffff);
+			} else {
+				Requested_Block_Struct *pBlock = new Requested_Block_Struct;
+				if (GetNextEmptyBlockInPart(sender->GetLastPartAsked(), pBlock) == true) {
+					// Keep a track of all pending requested blocks
+					m_requestedblocks_list.push_back(pBlock);
+					// Update list of blocks to return
+					toadd.push_back(pBlock);
+					newBlockCount++;
+					// Skip end of loop (=> CPU load)
+					continue;
+				} else {
+					// All blocks for this chunk have been already requested
+					delete pBlock;
+					// => Try to select another chunk
+					sender->SetLastPartAsked(0xffff);
+				}
+			}
+		}
+
+		// Check if a new chunk must be selected (e.g. download starting, previous chunk complete)
+		if (sender->GetLastPartAsked() == 0xffff) {
+			// Quantify all chunks (create list of chunks to download)
+			// This is done only one time and only if it is necessary (=> CPU load)
+			if (chunksList.empty()) {
+				// Identify the locally missing part(s) that this source has
+				for (uint16 i = 0; i < partCount; ++i) {
+					if (!ForcePartSelection::IsAllowed(GetFileHash(), i)) {
+						continue;
+					}
+					if (sender->IsPartAvailable(i) == true &&
+						GetNextEmptyBlockInPart(i, NULL) == true) {
+						// Create a new entry for this chunk and add it to the list
+						Chunk newEntry;
+						newEntry.part = i;
+						newEntry.frequency = m_SrcpartFrequency[i];
+						chunksList.push_back(newEntry);
+					}
+				}
+
+				// Check if any blocks(s) could be downloaded
+				if (chunksList.empty()) {

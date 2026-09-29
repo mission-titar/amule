@@ -35,6 +35,8 @@
 #include "DownloadQueue.h"
 #include "FileDetailDialog.h" // Needed for CFileDetailDialog
 #include "FileLaunch.h"       // Needed for FileLaunch::Open / Reveal
+#include "ForcePartDialog.h" // Needed for CForcePartDialog
+#include "ForcePartSelection.h" // Needed for forced-part state
 #include "GuiEvents.h"        // Needed for CoreNotify_*, Notify_DownloadCtrlDoItemSelectionChanged
 #include "Logger.h"
 #include "MuleBarRenderer.h" // Needed for CBarFillSpec, CBarFillSpan, CMuleBarRenderer
@@ -176,6 +178,8 @@ wxBEGIN_EVENT_TABLE(CDownloadListCtrl, CMuleVirtualDataViewCtrl)
 	EVT_MENU(MP_GETMAGNETLINK, CDownloadListCtrl::OnGetLink)
 	EVT_MENU(MP_GETED2KLINK, CDownloadListCtrl::OnGetLink)
 	EVT_MENU(MP_RAZORSTATS, CDownloadListCtrl::OnRazorStatsCheck)
+	EVT_MENU(MP_FORCEPART, CDownloadListCtrl::OnForcePart)
+	EVT_MENU(MP_CLEARFORCEPART, CDownloadListCtrl::OnClearForcePart)
 
 	EVT_MENU(MP_METINFO, CDownloadListCtrl::OnViewFileInfo)
 	EVT_MENU(MP_VIEW, CDownloadListCtrl::OnPreviewFile)
@@ -465,6 +469,8 @@ void CDownloadListCtrl::OnItemRightClicked(wxDataViewEvent &event)
 	extendedmenu->Append(MP_SWAP_A4AF_TO_ANY_OTHER, _("Swap every A4AF to any other file now"));
 	m_menu->Append(MP_MENU_EXTD, _("Extended Options"), extendedmenu);
 	m_menu->AppendSeparator();
+	m_menu->Append(MP_FORCEPART, _("Force download of a part..."));
+m_menu->Append(MP_CLEARFORCEPART, _("Cancel forced download"));
 
 	m_menu->Append(MP_VIEW, _("Preview"));
 	m_menu->Append(MP_SHOWINFOLDER, _("Show in file manager"));
@@ -552,6 +558,10 @@ void CDownloadListCtrl::OnItemRightClicked(wxDataViewEvent &event)
 	priomenu->Check(MP_PRIOAUTO, priority == PR_AUTO);
 
 	m_menu->Enable(MP_MENU_EXTD, canPause);
+	const bool forceMatchesFile = ForcePartSelection::IsActive() &&
+		file->GetFileHash() == ForcePartSelection::GetFileHash();
+	m_menu->Enable(MP_FORCEPART, theApp->downloadqueue != nullptr && file->GetPartCount() > 0);
+	m_menu->Enable(MP_CLEARFORCEPART, forceMatchesFile);
 
 	PopupMenu(m_menu, event.GetPosition());
 
@@ -751,6 +761,41 @@ void CDownloadListCtrl::OnRazorStatsCheck(wxCommandEvent &WXUNUSED(event))
 	}
 	const CPartFile *file = reinterpret_cast<CPartFile *>(m_menuItem);
 	theApp->amuledlg->LaunchUrl(thePrefs::GetStatsServerURL() + file->GetFileHash().Encode());
+}
+
+void CDownloadListCtrl::OnForcePart(wxCommandEvent &WXUNUSED(event))
+{
+	if (m_menuItem == 0 || !HasItemData(m_menuItem) || theApp->downloadqueue == nullptr) {
+		return;
+	}
+
+	CPartFile *file = reinterpret_cast<CPartFile *>(m_menuItem);
+	if (file->GetPartCount() == 0) {
+		return;
+	}
+
+	CForcePartDialog dialog(this, file);
+	if (dialog.ShowModal() == wxID_OK && dialog.WasAccepted()) {
+		AddLogLineNS(CFormat(LOG_PRELOCALE("GUI forced download part: %s:%u\n")) %
+			dialog.GetFileHash().Encode() % static_cast<unsigned>(dialog.GetPart()));
+	}
+}
+
+void CDownloadListCtrl::OnClearForcePart(wxCommandEvent &WXUNUSED(event))
+{
+	if (m_menuItem == 0 || !HasItemData(m_menuItem)) {
+		return;
+	}
+
+	CPartFile *file = reinterpret_cast<CPartFile *>(m_menuItem);
+	if (!ForcePartSelection::IsActive() ||
+		file->GetFileHash() != ForcePartSelection::GetFileHash()) {
+		return;
+	}
+
+	ForcePartSelection::Clear();
+	AddLogLineNS(LOG_PRELOCALE("GUI forced download restriction cleared\n"));
+	RefreshItemData(reinterpret_cast<wxUIntPtr>(file));
 }
 
 void CDownloadListCtrl::OnItemActivated(wxDataViewEvent &event)

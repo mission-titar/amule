@@ -129,6 +129,9 @@ public:
 	bool Render(wxRect cell, wxDC *dc, int state) override;
 	wxSize GetSize() const override;
 
+	//! Supply a bar specification to a standalone widget as well as a data-view cell.
+	void SetSpec(const CBarFillSpec &spec) { m_spec = spec; }
+
 protected:
 	//! For a subclass that draws more than the chunk bar (CDownloadBarRenderer's completed-
 	//! strip and percent text, say) and needs back the data SetValue() already unpacked.

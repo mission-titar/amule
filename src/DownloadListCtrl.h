@@ -200,6 +200,8 @@ private:
 	void OnPreviewFile(wxCommandEvent &event);
 	void OnShowInFolder(wxCommandEvent &event);
 	void OnRazorStatsCheck(wxCommandEvent &event);
+	void OnForcePart(wxCommandEvent &event);
+	void OnClearForcePart(wxCommandEvent &event);
 
 	/**
 	 * The item the context menu was built for, by identity rather than row.

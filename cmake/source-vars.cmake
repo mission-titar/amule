@@ -102,6 +102,8 @@ if (BUILD_MONOLITHIC OR BUILD_REMOTEGUI)
 		CommentDialogLst.cpp
 		DirectoryTreeCtrl.cpp
 		DownloadListCtrl.cpp
+		ForcePartDialog.cpp
+		ForcePartStatusBar.cpp
 		FileDetailDialog.cpp
 		FileLaunch.cpp
 		FriendListCtrl.cpp
@@ -156,6 +158,7 @@ if (BUILD_MONOLITHIC OR BUILD_DAEMON OR BUILD_REMOTEGUI)
 		Logger.cpp
 		MediaProbe.cpp
 		PartFile.cpp
+		ForcePartSelection.cpp
 		Preferences.cpp
 		Proxy.cpp
 		Server.cpp

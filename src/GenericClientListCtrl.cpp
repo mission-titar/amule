@@ -33,7 +33,9 @@
 #include "BarShader.h"     // Needed for CBarShader
 #include "BitVector.h"
 #include "ClientDetailDialog.h"   // Needed for CClientDetailDialog
-#include "ClientContextActions.h" // Needed for BuildClientContextMenu, ClientAction*
+#include "ClientContextActions.h"
+#include "ForcePartDialog.h"
+#include "ForcePartSelection.h" // Needed for BuildClientContextMenu, ClientAction*
 #include "ClientNameCell.h"       // Needed for MakeClientNameCell, DrawClientNameCell
 #include "ChatWnd.h"              // Needed for CChatWnd
 #include "CommentDialogLst.h"     // Needed for CCommentDialogLst
@@ -105,6 +107,7 @@ wxBEGIN_EVENT_TABLE(CGenericClientListCtrl, CMuleVirtualDataViewCtrl)
 	EVT_MIDDLE_DOWN(CGenericClientListCtrl::OnMouseMiddleClick)
 
 	EVT_MENU(MP_CHANGE2FILE, CGenericClientListCtrl::OnSwapSource)
+	EVT_MENU(MP_FORCEPARTSOURCE, CGenericClientListCtrl::OnForcePartSource)
 	EVT_MENU(MP_SHOWLIST, CGenericClientListCtrl::OnViewFiles)
 	EVT_MENU(MP_ADDFRIEND, CGenericClientListCtrl::OnAddFriend)
 	EVT_MENU(MP_FRIENDSLOT, CGenericClientListCtrl::OnSetFriendslot)
@@ -537,6 +540,31 @@ void CGenericClientListCtrl::OnSwapSource(wxCommandEvent &WXUNUSED(event))
 	}
 }
 
+void CGenericClientListCtrl::OnForcePartSource(wxCommandEvent &WXUNUSED(event))
+{
+	if (m_menuItem == 0 || !HasItemData(m_menuItem) || theApp->downloadqueue == nullptr) {
+		return;
+	}
+
+	ClientCtrlItem_Struct *item = reinterpret_cast<ClientCtrlItem_Struct *>(m_menuItem);
+	if (item == nullptr || item->GetOwner() == nullptr || !item->GetOwner()->IsPartFile()) {
+		return;
+	}
+
+	CClientRef &source = item->GetSource();
+	if (!source.IsLinked() || source.GetUserHash().IsEmpty()) {
+		return;
+	}
+
+	CPartFile *file = dynamic_cast<CPartFile *>(item->GetOwner());
+	if (file == nullptr || file->GetPartCount() == 0) {
+		return;
+	}
+
+	CForcePartDialog dialog(this, file, &source);
+	dialog.ShowModal();
+}
+
 namespace
 {
 //! The peers behind the current selection, as the shared actions want them.
@@ -699,6 +727,11 @@ void CGenericClientListCtrl::OnItemRightClicked(wxDataViewEvent &event)
 	if (IsShowingDownloadSources()) {
 		m_menu->Append(MP_CHANGE2FILE, _("Swap to this file"));
 		m_menu->Enable(MP_CHANGE2FILE, item->GetType() == A4AF_SOURCE);
+
+		const bool hasPartFileOwner = item->GetOwner() != nullptr && item->GetOwner()->IsPartFile();
+		const bool hasUserHash = client.IsLinked() && !client.GetUserHash().IsEmpty();
+		m_menu->Append(MP_FORCEPARTSOURCE, _("Force this source for a part..."));
+		m_menu->Enable(MP_FORCEPARTSOURCE, theApp->downloadqueue != nullptr && hasPartFileOwner && hasUserHash);
 	}
 
 	// Asking the list which of its own columns has a legend keeps this true for

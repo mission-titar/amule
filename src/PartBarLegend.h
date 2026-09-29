@@ -88,6 +88,10 @@ constexpr BarColour kFlatClientOnly{ 0, 0, 0 };
 constexpr BarColour kPending{ 255, 208, 0 };
 constexpr BarColour kNextPending{ 255, 255, 100 };
 
+// Selection cue used by the forced-part dialog. Orange is deliberately distinct from the
+// yellow request cues above while fitting the existing bar palette.
+constexpr BarColour kForcedSelection{ 255, 140, 0 };
+
 constexpr BarColour kUnavailable{ 240, 240, 240 };
 constexpr BarColour kFlatUnavailable{ 224, 224, 224 };
 

@@ -29,6 +29,7 @@
 
 #include <wx/wx.h>
 #include <wx/cmdline.h>  // Needed for wxCmdLineParser
+#include "ForcePartSelection.h"
 #include <wx/evtloop.h>  // Needed for wxEventLoopBase
 #include <wx/filename.h> // Needed for wxFileName
 #include <wx/filesys.h>  // Needed for wxFileSystem::URLToFileName
@@ -464,6 +465,12 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 #endif
 
 	cmdline.AddOption("t", "category", "Set category for passed ED2K links.", wxCMD_LINE_VAL_NUMBER);
+	cmdline.AddOption("", "force-part",
+		"Only request one part of one file: <ed2k-hash>:<part-number>.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddOption("", "force-part-source",
+		"Only request one part of one file from one source: <ed2k-hash>:<part-number>:<user-hash>.",
+		wxCMD_LINE_VAL_STRING);
 	cmdline.AddParam(
 		"ED2K link", wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL | wxCMD_LINE_PARAM_MULTIPLE);
 
@@ -484,6 +491,68 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 			(const char *)unicode2char(
 				wxString(CFormat("%s (OS: %s)") % FullMuleVersion % OSType)));
 		return false;
+	}
+
+
+	wxString forcePartArg;
+	wxString forcePartSourceArg;
+	if (cmdline.Found("force-part", &forcePartArg) &&
+		cmdline.Found("force-part-source", &forcePartSourceArg)) {
+		fprintf(stderr, "--force-part and --force-part-source cannot be used together\n");
+		return false;
+	}
+
+	if (cmdline.Found("force-part", &forcePartArg)) {
+		const int separator = forcePartArg.Find(':', true);
+		if (separator <= 0 || separator >= static_cast<int>(forcePartArg.length()) - 1) {
+			fprintf(stderr, "--force-part expects <ed2k-hash>:<part-number>\n");
+			return false;
+		}
+
+		const wxString hashText = forcePartArg.Left(separator);
+		const wxString partText = forcePartArg.Mid(separator + 1);
+		CMD4Hash fileHash;
+		long partNumber = -1;
+		if (!fileHash.Decode(hashText) || !partText.ToLong(&partNumber) ||
+			partNumber < 0 || partNumber >= 0xffff) {
+			fprintf(stderr,
+				"--force-part expects a valid 32-character ED2K hash and a part number from 0 to 65534\n");
+			return false;
+		}
+
+		ForcePartSelection::Set(fileHash, static_cast<uint32>(partNumber));
+		AddLogLineNS(CFormat(LOG_PRELOCALE("Forced download part: %s:%u\n")) % hashText %
+			static_cast<unsigned>(partNumber));
+	}
+
+	if (cmdline.Found("force-part-source", &forcePartSourceArg)) {
+		const int lastSeparator = forcePartSourceArg.Find(':', true);
+		const int firstSeparator = forcePartSourceArg.Find(':');
+		if (firstSeparator <= 0 || lastSeparator <= firstSeparator ||
+			lastSeparator >= static_cast<int>(forcePartSourceArg.length()) - 1) {
+			fprintf(stderr,
+				"--force-part-source expects <ed2k-hash>:<part-number>:<user-hash>\n");
+			return false;
+		}
+
+		const wxString hashText = forcePartSourceArg.Left(firstSeparator);
+		const wxString partText =
+			forcePartSourceArg.Mid(firstSeparator + 1, lastSeparator - firstSeparator - 1);
+		const wxString userHashText = forcePartSourceArg.Mid(lastSeparator + 1);
+
+		CMD4Hash fileHash;
+		CMD4Hash userHash;
+		long partNumber = -1;
+		if (!fileHash.Decode(hashText) || !userHash.Decode(userHashText) ||
+			!partText.ToLong(&partNumber) || partNumber < 0 || partNumber >= 0xffff) {
+			fprintf(stderr,
+				"--force-part-source expects valid 32-character ED2K and User hashes and a part number from 0 to 65534\n");
+			return false;
+		}
+
+		ForcePartSelection::SetSource(fileHash, static_cast<uint32>(partNumber), userHash);
+		AddLogLineNS(CFormat(LOG_PRELOCALE("Forced download part/source: %s:%u:%s\n")) %
+			hashText % static_cast<unsigned>(partNumber) % userHashText);
 	}
 
 	wxString autostart_arg;
