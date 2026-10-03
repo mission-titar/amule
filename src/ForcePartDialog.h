@@ -9,6 +9,8 @@
 
 #include "MD4Hash.h"
 
+#include <vector>
+
 #include <wx/string.h>
 
 #include <wx/dialog.h>
@@ -16,6 +18,9 @@
 class CPartFile;
 class CClientRef;
 class CForcePartStatusBar;
+class wxCheckBox;
+class wxChoice;
+class wxTextCtrl;
 
 class CForcePartDialog : public wxDialog
 {
@@ -34,8 +39,16 @@ private:
 	bool m_hasSource;
 	bool m_accepted;
 	CForcePartStatusBar *m_partStatusBar;
+	wxCheckBox *m_relaySequence;
+	wxCheckBox *m_relayFinalPartFirst;
+	wxCheckBox *m_relayPingPong;
+	wxTextCtrl *m_originHashText;
+	wxChoice *m_originChoice;
+	std::vector<CMD4Hash> m_originHashes;
+	wxTextCtrl *m_nicknameBaseText;
 
 	void OnAccept(wxCommandEvent &event);
+	void OnOriginChoice(wxCommandEvent &event);
 	void OnCancel(wxCommandEvent &event);
 
 	wxDECLARE_EVENT_TABLE();

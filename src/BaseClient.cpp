@@ -65,6 +65,7 @@
 #include "ClientVersionString.h"
 #include "ClientList.h"       // Needed for CClientList
 #include "ChatSessionStore.h" // Needed for CChatSessionStore
+#include "ForcePartSelection.h"
 #ifndef AMULE_DAEMON
 #include "amuleDlg.h"      // Needed for CamuleDlg
 #include "CaptchaDialog.h" // Needed for CCaptchaDialog
@@ -3174,8 +3175,276 @@ void CUpDownClient::ProcessCaptchaReqRes(uint8 nStatus)
 // with the message filter alone. By-value to match the header signature: the non-daemon
 // path reassigns `message` (captcha), so the parameter cannot be const-ref.
 // NOLINTNEXTLINE(performance-unnecessary-value-param)
+#ifndef CLIENT_GUI
+static bool HandleRelayControlMessage(CUpDownClient *sender, const wxString &message)
+{
+	if (!message.StartsWith("KRLY1|")) {
+		return false;
+	}
+
+	const wxArrayString fields = wxStringTokenize(message, "|", wxTOKEN_RET_EMPTY_ALL);
+	if (fields.size() < 2 ||
+		(fields[1] != "OFFER" && fields[1] != "ACK" && fields[1] != "JOIN" &&
+			fields[1] != "BACKFILL" && fields[1] != "BACKFILL_ACK") ||
+		((fields[1] == "ACK" || fields[1] == "BACKFILL" ||
+			fields[1] == "BACKFILL_ACK") && fields.size() != 4) ||
+		(fields[1] == "JOIN" && fields.size() != (ForcePartSelection::IsSequenceByName() ? 5 : 4)) ||
+		(fields[1] == "OFFER" && fields.size() != (ForcePartSelection::IsSequenceByName() ? 5 : 4))) {
+		if (fields.size() > 1 && fields[1] == "JOIN") {
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Rejected malformed relay JOIN from '%s' (%s)\n")) %
+				sender->GetUserName() % sender->GetFullIP());
+		}
+		return true;
+	}
+
+	CMD4Hash fileHash;
+	long part = -1;
+	if (!fileHash.Decode(fields[2]) || !fields[3].ToLong(&part) || part < 0 || part >= 0xffff ||
+		!ForcePartSelection::IsSequenceConfigured(fileHash)) {
+		return true;
+	}
+
+	const uint32 stagePart = ForcePartSelection::GetSequencePart();
+	if (fields[1] == "JOIN") {
+		CMD4Hash joinedOriginHash;
+		const bool pingPong = ForcePartSelection::IsSequencePingPong();
+		const bool localEvenNode = stagePart % 2 == 0;
+		const bool validJoinPart = !pingPong
+			? static_cast<uint32>(part) == stagePart
+			: (localEvenNode
+				? static_cast<uint32>(part) == stagePart
+				: static_cast<uint32>(part) + 2 == stagePart);
+		const wxString &expectedJoinName = pingPong && !localEvenNode
+			? ForcePartSelection::GetSequenceUpstreamName()
+			: ForcePartSelection::GetSequenceDownstreamName();
+		if (!ForcePartSelection::IsSequenceByName() ||
+			!validJoinPart || sender->GetUserHash().IsEmpty() ||
+			sender->GetUserName() != expectedJoinName ||
+			!joinedOriginHash.Decode(fields[4]) ||
+			joinedOriginHash != ForcePartSelection::GetSequenceOrigin() ||
+			!theApp->downloadqueue) {
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Rejected relay JOIN from '%s' (%s): nickname, stage, origin hash, or sequence mismatch\n")) %
+				sender->GetUserName() % sender->GetFullIP());
+			return true;
+		}
+		CPartFile *file = theApp->downloadqueue->GetFileByID(fileHash);
+		const bool firstJoin = ForcePartSelection::GetSequenceDownstream().IsEmpty();
+		if (!file) {
+			AddLogLineNS(LOG_PRELOCALE("Rejected relay JOIN: matching download file is not loaded\n"));
+			return true;
+		}
+		if (pingPong && !localEvenNode) {
+			if (!ForcePartSelection::BindSequenceUpstream(
+					fileHash, sender->GetUserHash(), sender->GetIP(), sender->GetUserPort())) {
+				return true;
+			}
+			return true;
+		}
+		if (!ForcePartSelection::BindSequenceDownstream(
+				fileHash, sender->GetUserHash(), sender->GetIP(), sender->GetUserPort())) {
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Rejected relay JOIN from '%s' (%s): downstream identity could not be bound\n")) %
+				sender->GetUserName() % sender->GetFullIP());
+			return true;
+		}
+		if (pingPong && !ForcePartSelection::GetSequenceUpstreamName().IsEmpty() &&
+			!ForcePartSelection::BindSequenceUpstream(
+				fileHash, sender->GetUserHash(), sender->GetIP(), sender->GetUserPort())) {
+			return true;
+		}
+		if (firstJoin) {
+			AddLogLineNS(CFormat(LOG_PRELOCALE("Relay downstream '%s' joined by UserHash %s\n")) %
+				sender->GetUserName() % sender->GetUserHash().Encode());
+			ForcePartSelection::ReportSequenceProgress(CFormat(
+				"Downstream '%s' joined; offering the verified scheduled part") % sender->GetUserName());
+		}
+		return true;
+	}
+	if (fields[1] == "ACK") {
+		const CMD4Hash &ackPeer = ForcePartSelection::IsSequencePingPong()
+			? ForcePartSelection::GetSequenceBackfillPeer()
+			: ForcePartSelection::GetSequenceDownstream();
+		if (static_cast<uint32>(part) == stagePart &&
+			(sender->GetUserHash() == ackPeer) &&
+			(!ForcePartSelection::IsSequenceByName() ||
+				sender->GetUserName() == ForcePartSelection::GetSequenceDownstreamName())) {
+			CPartFile *file = theApp->downloadqueue
+				? theApp->downloadqueue->GetFileByID(fileHash)
+				: NULL;
+			const uint32 acknowledgedPart = file
+				? ForcePartSelection::GetSequenceFilePart(file->GetPartCount(), part) : 0;
+			if (file && file->IsPartVerified(static_cast<uint16>(acknowledgedPart))) {
+				const bool firstAcknowledgement =
+					!ForcePartSelection::IsSequenceDownstreamAcknowledged(fileHash);
+				ForcePartSelection::MarkSequenceDownstreamAcknowledged(fileHash);
+				if (firstAcknowledgement) {
+					AddLogLineNS(CFormat(LOG_PRELOCALE("Relay downstream acknowledged file part %u\n")) %
+						acknowledgedPart);
+					ForcePartSelection::ReportSequenceProgress(CFormat(
+						"Downstream acknowledged file part %u; this relay stage is complete") %
+						acknowledgedPart);
+				}
+			}
+		}
+		return true;
+	}
+	if (fields[1] == "BACKFILL_ACK") {
+		const wxString &ackPeerName = ForcePartSelection::IsSequencePingPong()
+			? (ForcePartSelection::GetSequenceUpstream().IsEmpty()
+				? ForcePartSelection::GetSequenceDownstreamName()
+				: ForcePartSelection::GetSequenceUpstreamName())
+			: ForcePartSelection::GetSequenceUpstreamName();
+		if (sender->GetUserHash() == ForcePartSelection::GetSequenceBackfillPeer() &&
+			(!ForcePartSelection::IsSequenceByName() ||
+				sender->GetUserName() == ackPeerName) &&
+			ForcePartSelection::MarkSequenceBackfillAcknowledged(
+				fileHash, static_cast<uint32>(part))) {
+			AddLogLineNS(CFormat(LOG_PRELOCALE("Relay upstream accepted backfill part %u\n")) % part);
+		}
+		return true;
+	}
+	if (fields[1] == "BACKFILL") {
+		const uint32 backfillStep = static_cast<uint32>(part);
+		const CMD4Hash &backfillPeer = ForcePartSelection::IsSequencePingPong()
+			? ForcePartSelection::GetSequenceBackfillPeer()
+			: ForcePartSelection::GetSequenceDownstream();
+		const wxString &backfillPeerName = ForcePartSelection::IsSequencePingPong() &&
+			!ForcePartSelection::GetSequenceUpstream().IsEmpty()
+			? ForcePartSelection::GetSequenceUpstreamName()
+			: ForcePartSelection::GetSequenceDownstreamName();
+		const bool validPeer = sender->GetUserHash() == backfillPeer &&
+			(!ForcePartSelection::IsSequenceByName() ||
+				sender->GetUserName() == backfillPeerName);
+		if (!validPeer || !theApp->downloadqueue) {
+			return true;
+		}
+		CPartFile *file = theApp->downloadqueue->GetFileByID(fileHash);
+		if (!file || backfillStep >= file->GetPartCount() ||
+			(file->GetStatus() != PS_READY && file->GetStatus() != PS_EMPTY)) {
+			return true;
+		}
+		const uint32 backfillPart = ForcePartSelection::GetSequenceFilePart(
+			file->GetPartCount(), backfillStep);
+		const bool initialPingPongBackfill = ForcePartSelection::IsSequencePingPong() &&
+			stagePart == 1 && backfillStep == 0;
+		if (ForcePartSelection::IsSequencePingPong() && backfillStep < stagePart &&
+			!initialPingPongBackfill) {
+			if (file->IsPartVerified(static_cast<uint16>(backfillPart))) {
+				const wxString ack = CFormat("KRLY1|BACKFILL_ACK|%s|%u") %
+					fileHash.Encode() % backfillStep;
+				theApp->clientlist->SendChatMessage(sender->GetUserHash(), sender->GetIP(),
+					sender->GetUserPort(), ack);
+			}
+			return true;
+		}
+		if (!initialPingPongBackfill && backfillStep <= stagePart) {
+			return true;
+		}
+		const bool firstRequest = ForcePartSelection::AcceptSequenceBackfill(fileHash, backfillStep);
+		if (!firstRequest && !ForcePartSelection::IsSequenceBackfillReceived(fileHash, backfillStep)) {
+			return true;
+		}
+		if (firstRequest) {
+			if (sender->GetRequestFile() != file) {
+				if (sender->GetDownloadState() == DS_DOWNLOADING && !sender->GetSentCancelTransfer()) {
+					CPacket *cancel = new CPacket(OP_CANCELTRANSFER, 0, OP_EDONKEYPROT);
+					theStats::AddUpOverheadFileRequest(cancel->GetPacketSize());
+					sender->SendPacket(cancel, true, true);
+					sender->SetSentCancelTransfer(true);
+				}
+				if (sender->GetDownloadState() == DS_DOWNLOADING) {
+					sender->SetDownloadState(DS_ONQUEUE);
+				}
+				sender->SetRequestFile(file);
+				sender->SetLastPartAsked(0xffff);
+				sender->SetSentCancelTransfer(false);
+			} else if (sender->GetDownloadState() == DS_NONEEDEDPARTS) {
+				// The paired node may have been marked as having no needed parts
+				// after its previous parity part was received. A new BACKFILL is
+				// an explicit assignment of another part from that same peer, so
+				// move it back into the normal source queue before applying the
+				// per-part source rule.
+				sender->SetLastPartAsked(0xffff);
+				sender->SetDownloadState(DS_ONQUEUE);
+			}
+			sender->ResetLastAskedTime();
+			file->AddSource(sender);
+			ForcePartSelection::SetPartSource(fileHash, backfillPart, sender->GetUserHash());
+			file->ApplyForcedPartSelection();
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Relay backfill file part %u (schedule step %u) requested from downstream '%s'\n")) %
+				backfillPart % backfillStep % sender->GetUserName());
+		}
+		if (file->IsPartVerified(static_cast<uint16>(backfillPart))) {
+			const wxString ack = CFormat("KRLY1|BACKFILL_ACK|%s|%u") %
+				fileHash.Encode() % backfillStep;
+			if (theApp->clientlist->SendChatMessage(sender->GetUserHash(), sender->GetIP(),
+					sender->GetUserPort(), ack)) {
+				ForcePartSelection::MarkSequenceBackfillAcknowledgedLocally(fileHash, backfillStep);
+			}
+		}
+		return true;
+	}
+
+	if (stagePart == 0 || static_cast<uint32>(part) != stagePart - 1 ||
+		!theApp->downloadqueue) {
+		return true;
+	}
+	CMD4Hash offeredOriginHash;
+	if (ForcePartSelection::IsSequenceByName()) {
+		if (sender->GetUserName() != ForcePartSelection::GetSequenceUpstreamName() ||
+			!offeredOriginHash.Decode(fields[4])) {
+			return true;
+		}
+	} else if (sender->GetUserHash() != ForcePartSelection::GetSequenceUpstream()) {
+		return true;
+	}
+	CPartFile *file = theApp->downloadqueue->GetFileByID(fileHash);
+	if (!file || static_cast<uint32>(part) >= file->GetPartCount() ||
+		(file->GetStatus() != PS_READY && file->GetStatus() != PS_EMPTY)) {
+		return true;
+	}
+	if (ForcePartSelection::IsSequenceByName() &&
+		(!ForcePartSelection::BindSequenceOrigin(fileHash, offeredOriginHash) ||
+			!ForcePartSelection::BindSequenceUpstream(fileHash, sender->GetUserHash()))) {
+		return true;
+	}
+
+	if (sender->GetRequestFile() != file) {
+		if (sender->GetDownloadState() == DS_DOWNLOADING && !sender->GetSentCancelTransfer()) {
+			CPacket *cancel = new CPacket(OP_CANCELTRANSFER, 0, OP_EDONKEYPROT);
+			theStats::AddUpOverheadFileRequest(cancel->GetPacketSize());
+			sender->SendPacket(cancel, true, true);
+			sender->SetSentCancelTransfer(true);
+		}
+		if (sender->GetDownloadState() == DS_DOWNLOADING) {
+			sender->SetDownloadState(DS_ONQUEUE);
+		}
+		sender->SetRequestFile(file);
+		sender->SetLastPartAsked(0xffff);
+		sender->SetSentCancelTransfer(false);
+	}
+	sender->ResetLastAskedTime();
+	file->AddSource(sender);
+	file->ApplyForcedPartSelection();
+	AddLogLineNS(CFormat(LOG_PRELOCALE("Relay upstream %s added for verified schedule step %u\n")) %
+		sender->GetUserName() % part);
+	ForcePartSelection::ReportSequenceProgress(CFormat(
+		"Accepted upstream '%s'; downloading and verifying the previous scheduled part") %
+		sender->GetUserName());
+	return true;
+}
+#endif
+
 void CUpDownClient::ProcessChatMessage(wxString message)
 {
+#ifndef CLIENT_GUI
+	if (HandleRelayControlMessage(this, message)) {
+		return;
+	}
+#endif
 	if (IsMessageFiltered(message)) {
 		AddLogLineC(CFormat(_("Message filtered from '%s' (IP:%s)")) % GetUserName() % GetFullIP());
 		return;

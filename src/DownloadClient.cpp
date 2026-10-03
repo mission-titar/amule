@@ -50,6 +50,7 @@
 #include "Logger.h"
 #include "GuiEvents.h"   // Needed for Notify_*
 #include "UploadQueue.h" // Needed for CUploadQueue
+#include "ForcePartSelection.h"
 
 #ifdef __MULE_UNUSED_CODE__
 // This function is left as a reminder.
@@ -873,6 +874,23 @@ void CUpDownClient::ProcessBlockPacket(const uint8_t *packet, uint32 size, bool 
 
 			if ((cur_block->block->StartOffset <= nStartPos) &&
 				(cur_block->block->EndOffset >= nStartPos)) {
+				const uint32 part = cur_block->block->StartOffset / PARTSIZE;
+				if (!ForcePartSelection::IsAllowed(m_reqfile->GetFileHash(), part) ||
+					!ForcePartSelection::IsSourceAllowed(
+						m_reqfile->GetFileHash(), part, GetUserHash())) {
+					AddDebugLogLineN(logLocalClient,
+						CFormat("Discarding block from disallowed source %s for part %u of %s") %
+							GetFullIP() % part % m_reqfile->GetFileName());
+					if (!GetSentCancelTransfer()) {
+						CPacket *cancel = new CPacket(OP_CANCELTRANSFER, 0, OP_EDONKEYPROT);
+						theStats::AddUpOverheadFileRequest(cancel->GetPacketSize());
+						ClearDownloadBlockRequests();
+						SendPacket(cancel, true, true);
+						SetSentCancelTransfer(true);
+					}
+					SetDownloadState(DS_ONQUEUE);
+					return;
+				}
 
 				if (cur_block->block->StartOffset == nStartPos) {
 					m_last_block_start = ::GetTickCount64();

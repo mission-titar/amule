@@ -383,6 +383,12 @@ bool CClientList::AttachToAlreadyKnown(
 	}
 
 	if (found_client != NULL) {
+		// An obfuscated server source reply can enrich an earlier UDP source entry for the
+		// same address/port (or Low-ID server tuple) with its UserHash. Preserve that identity
+		// on the reusable client object instead of deleting the only hashed copy below.
+		if (!found_client->HasValidHash() && tocheck->HasValidHash()) {
+			found_client->SetUserHash(tocheck->GetUserHash());
+		}
 		if (sender) {
 			if (found_client->GetSocket()) {
 				if (found_client->IsConnected() &&
@@ -851,6 +857,40 @@ bool CClientList::SendChatMessage(uint64 client_id, const wxString &message)
 		theApp->chatsessions->AddOutgoing(client_id, message);
 	}
 	return client->SendChatMessage(message);
+}
+
+bool CClientList::SendChatMessage(const CMD4Hash &userHash, const wxString &message)
+{
+	if (userHash.IsEmpty()) {
+		return false;
+	}
+	SourceList clients = GetClientsByHash(userHash);
+	for (SourceList::iterator it = clients.begin(); it != clients.end(); ++it) {
+		CUpDownClient *client = it->GetClient();
+		if (client) {
+			// A false return means the message was queued while the peer is connecting.
+			client->SendChatMessage(message);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool CClientList::SendChatMessage(
+	const CMD4Hash &userHash, uint32 ip, uint16 port, const wxString &message)
+{
+	if (SendChatMessage(userHash, message)) {
+		return true;
+	}
+	if (userHash.IsEmpty() || ip == 0 || port == 0) {
+		return false;
+	}
+	CClientRef ref = CreateForAddress(userHash, ip, port, wxEmptyString);
+	if (!ref.IsLinked()) {
+		return false;
+	}
+	ref.GetClient()->SendChatMessage(message);
+	return true;
 }
 
 void CClientList::SetChatState(uint64 client_id, uint8 state)

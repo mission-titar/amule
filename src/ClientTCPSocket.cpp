@@ -52,6 +52,7 @@
 #include "UploadQueue.h"                // Needed for CUploadQueue
 #include "ClientUDPSocket.h"            // Needed for CClientUDPSocket
 #include "PartFile.h"                   // Needed for CPartFile
+#include "ForcePartSelection.h"         // Needed for relay peer request handling
 #include "MemFile.h"                    // Needed for CMemFile
 #include "kademlia/kademlia/Kademlia.h" // Needed for CKademlia::Kademlia
 #include "kademlia/kademlia/Prefs.h"    // Needed for CKademlia::CPrefs
@@ -656,7 +657,15 @@ bool CClientTCPSocket::ProcessPacket(const uint8_t *buffer, uint32 size, uint8 o
 			break;
 		}
 
-		m_client->CheckForAggressive();
+		const bool pingPongPeer = size == 16 && ForcePartSelection::IsSequencePingPongPeer(
+			CMD4Hash(buffer), m_client->GetUserHash());
+		if (pingPongPeer) {
+			AddDebugLogLineN(logRemoteClient,
+				"Skipping aggressive request penalty for configured ping-pong peer " +
+				m_client->GetFullIP());
+		} else {
+			m_client->CheckForAggressive();
+		}
 		if (m_client->IsBanned()) {
 			break;
 		}

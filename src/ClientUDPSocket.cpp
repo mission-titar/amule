@@ -34,6 +34,7 @@
 
 #include "Preferences.h"     // Needed for CPreferences
 #include "PartFile.h"        // Needed for CPartFile
+#include "ForcePartSelection.h" // Needed for relay peer request handling
 #include "updownclient.h"    // Needed for CUpDownClient
 #include "UploadQueue.h"     // Needed for CUploadQueue
 #include "Packet.h"          // Needed for CPacket
@@ -438,7 +439,14 @@ void CClientUDPSocket::ProcessPacket(uint8_t *packet, int16 size, int8 opcode, u
 		}
 
 		if (sender) {
-			sender->CheckForAggressive();
+			if (ForcePartSelection::IsSequencePingPongPeer(
+					reqfilehash, sender->GetUserHash())) {
+				AddDebugLogLineN(logClientUDP,
+					"Skipping aggressive reask penalty for configured ping-pong peer " +
+					sender->GetFullIP());
+			} else {
+				sender->CheckForAggressive();
+			}
 			if (sender->IsBanned()) {
 				// CheckForAggressive can call Ban() on score >= 10. Mirror the TCP
 				// file-request path at ClientTCPSocket.cpp:539 and short-circuit,

@@ -55,6 +55,7 @@
 #include "FileLock.h"               // Needed for CFileLock
 #include "GuiEvents.h"              // Needed for Notify_*
 #include "KnownFile.h"
+#include "NetworkFunctions.h"
 #include "Logger.h"
 #include "MagnetURI.h"        // Needed for CMagnetURI
 #include "MuleCollection.h"   // Needed for expanding .emulecollection arguments
@@ -471,6 +472,27 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 	cmdline.AddOption("", "force-part-source",
 		"Only request one part of one file from one source: <ed2k-hash>:<part-number>:<user-hash>.",
 		wxCMD_LINE_VAL_STRING);
+	cmdline.AddOption("", "force-part-route",
+		"Route one part only from one source (repeatable): <ed2k-hash>:<part-number>:<user-hash>. "
+		"Unspecified parts are locked.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddOption("", "force-part-sequence",
+		"Fetch a verified prefix from upstream, then one part from origin and notify downstream: "
+		"<ed2k-hash>:<part>:<origin-user-hash>:<upstream-user-hash-or->:"
+		"<downstream-user-hash-or-[@IPv4@tcp-port]>.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddOption("", "force-part-sequence-name",
+		"Run a CLI relay stage; join the named upstream and notify the named downstream: "
+		"<ed2k-hash>:<part>:<origin-user-hash>:<upstream-nickname-or->:<downstream-nickname-or->.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddOption("", "force-part-sequence-chain",
+		"Run a relay stage using one shared nickname base; the number is a sequence stage ordinal and "
+		"neighbors are derived as <base>-<stage>: <ed2k-hash>:<stage>:<origin-user-hash>:<nickname-base>.",
+		wxCMD_LINE_VAL_STRING);
+	cmdline.AddSwitch("", "force-part-sequence-pingpong",
+		"Use two relay daemons alternately; configure starting sequence ordinal 0 or 1.");
+	cmdline.AddSwitch("", "force-part-sequence-final-first",
+		"For --force-part-sequence-chain, download the final file part first, then part 0, part 1, ...");
 	cmdline.AddParam(
 		"ED2K link", wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL | wxCMD_LINE_PARAM_MULTIPLE);
 
@@ -496,13 +518,256 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 
 	wxString forcePartArg;
 	wxString forcePartSourceArg;
-	if (cmdline.Found("force-part", &forcePartArg) &&
-		cmdline.Found("force-part-source", &forcePartSourceArg)) {
+	wxString forcePartSequenceArg;
+	wxString forcePartSequenceNameArg;
+	wxString forcePartSequenceChainArg;
+	wxArrayString forcePartRoutes;
+	wxString forcePartRouteArg;
+	const bool hasForcePart = cmdline.Found("force-part", &forcePartArg);
+	const bool hasForcePartSource = cmdline.Found("force-part-source", &forcePartSourceArg);
+	const bool hasForcePartSequence = cmdline.Found("force-part-sequence", &forcePartSequenceArg);
+	const bool hasForcePartSequenceName =
+		cmdline.Found("force-part-sequence-name", &forcePartSequenceNameArg);
+	const bool hasForcePartSequenceChain =
+		cmdline.Found("force-part-sequence-chain", &forcePartSequenceChainArg);
+	const bool forcePartSequencePingPong = cmdline.Found("force-part-sequence-pingpong");
+	const bool forcePartSequenceFinalFirst = cmdline.Found("force-part-sequence-final-first");
+	if (forcePartSequencePingPong && !hasForcePartSequenceChain) {
+		fprintf(stderr, "--force-part-sequence-pingpong requires --force-part-sequence-chain\n");
+		return false;
+	}
+	if (forcePartSequenceFinalFirst && !hasForcePartSequenceChain) {
+		fprintf(stderr, "--force-part-sequence-final-first requires --force-part-sequence-chain\n");
+		return false;
+	}
+	while (cmdline.Found("force-part-route", &forcePartRouteArg)) {
+		forcePartRoutes.Add(forcePartRouteArg);
+	}
+	if (hasForcePart && hasForcePartSource) {
 		fprintf(stderr, "--force-part and --force-part-source cannot be used together\n");
 		return false;
 	}
+	if ((hasForcePartSequence || hasForcePartSequenceName || hasForcePartSequenceChain) &&
+		(hasForcePart || hasForcePartSource || !forcePartRoutes.IsEmpty())) {
+		fprintf(stderr, "relay sequence options cannot be combined with the other force-part options\n");
+		return false;
+	}
+	if ((hasForcePartSequence && hasForcePartSequenceName) ||
+		(hasForcePartSequence && hasForcePartSequenceChain) ||
+		(hasForcePartSequenceName && hasForcePartSequenceChain)) {
+		fprintf(stderr, "relay sequence options are exclusive\n");
+		return false;
+	}
+	if (!forcePartRoutes.IsEmpty() && (hasForcePart || hasForcePartSource)) {
+		fprintf(stderr, "--force-part-route cannot be combined with the other force-part options\n");
+		return false;
+	}
+	if (hasForcePartSequence) {
+		const int firstSeparator = forcePartSequenceArg.Find(':');
+		const int secondSeparator = forcePartSequenceArg.Find(':', firstSeparator + 1);
+		const int thirdSeparator = forcePartSequenceArg.Find(':', secondSeparator + 1);
+		const int fourthSeparator = forcePartSequenceArg.Find(':', thirdSeparator + 1);
+		const int fifthSeparator = forcePartSequenceArg.Find(':', fourthSeparator + 1);
+		if (firstSeparator <= 0 || secondSeparator <= firstSeparator + 1 ||
+			thirdSeparator <= secondSeparator + 1 || fourthSeparator <= thirdSeparator + 1 ||
+			fourthSeparator >= static_cast<int>(forcePartSequenceArg.length()) - 1 ||
+			fifthSeparator != wxNOT_FOUND) {
+			fprintf(stderr,
+				"--force-part-sequence expects <ed2k-hash>:<part>:<origin-user-hash>:"
+				"<upstream-user-hash-or->:<downstream-user-hash-or->\n");
+			return false;
+		}
 
-	if (cmdline.Found("force-part", &forcePartArg)) {
+		const wxString fileHashText = forcePartSequenceArg.Left(firstSeparator);
+		const wxString partText = forcePartSequenceArg.Mid(
+			firstSeparator + 1, secondSeparator - firstSeparator - 1);
+		const wxString originHashText = forcePartSequenceArg.Mid(
+			secondSeparator + 1, thirdSeparator - secondSeparator - 1);
+		const wxString upstreamHashText = forcePartSequenceArg.Mid(
+			thirdSeparator + 1, fourthSeparator - thirdSeparator - 1);
+		wxString downstreamHashText = forcePartSequenceArg.Mid(fourthSeparator + 1);
+		uint32 downstreamIP = 0;
+		uint16 downstreamPort = 0;
+		const int endpointStart = downstreamHashText.Find('@');
+		if (endpointStart != wxNOT_FOUND) {
+			const int portSeparator = downstreamHashText.Find('@', endpointStart + 1);
+			long port = 0;
+			if (portSeparator == wxNOT_FOUND ||
+				downstreamHashText.Find('@', portSeparator + 1) != wxNOT_FOUND ||
+				!StringIPtoUint32(downstreamHashText.Mid(endpointStart + 1,
+					portSeparator - endpointStart - 1), downstreamIP) ||
+				downstreamIP == 0 ||
+				!downstreamHashText.Mid(portSeparator + 1).ToLong(&port) ||
+				port < 1 || port > 65535) {
+				fprintf(stderr, "--force-part-sequence downstream endpoint must be @IPv4@tcp-port\n");
+				return false;
+			}
+			downstreamPort = static_cast<uint16>(port);
+			downstreamHashText = downstreamHashText.Left(endpointStart);
+		}
+		CMD4Hash fileHash;
+		CMD4Hash originHash;
+		CMD4Hash upstreamHash;
+		CMD4Hash downstreamHash;
+		long stagePart = -1;
+		if (!fileHash.Decode(fileHashText) || !originHash.Decode(originHashText) ||
+			!partText.ToLong(&stagePart) || stagePart < 0 || stagePart >= 0xffff ||
+			(upstreamHashText != "-" && !upstreamHash.Decode(upstreamHashText)) ||
+			(downstreamHashText != "-" && !downstreamHash.Decode(downstreamHashText)) ||
+			(stagePart > 0 && upstreamHashText == "-") ||
+			(stagePart == 0 && upstreamHashText != "-") ||
+			(downstreamHashText == "-" && (downstreamIP != 0 || downstreamPort != 0))) {
+			fprintf(stderr,
+				"--force-part-sequence expects valid hashes and part 0..65534; "
+				"part 0 needs upstream '-' and later parts need an upstream user hash; "
+				"downstream may include @IPv4@tcp-port\n");
+			return false;
+		}
+		ForcePartSelection::SetSequence(fileHash,
+			static_cast<uint32>(stagePart),
+			upstreamHash,
+			originHash,
+			downstreamHash,
+			downstreamIP,
+			downstreamPort);
+		AddLogLineNS(CFormat(LOG_PRELOCALE("Relay sequence configured at part %u for %s\n")) %
+			static_cast<unsigned>(stagePart) % fileHashText);
+	}
+	if (hasForcePartSequenceName) {
+		const int first = forcePartSequenceNameArg.Find(':');
+		const int second = forcePartSequenceNameArg.Find(':', first + 1);
+		const int third = forcePartSequenceNameArg.Find(':', second + 1);
+		const int fourth = forcePartSequenceNameArg.Find(':', third + 1);
+		if (first <= 0 || second <= first + 1 || third <= second + 1 ||
+			fourth <= third + 1 || fourth >= static_cast<int>(forcePartSequenceNameArg.length()) - 1 ||
+			forcePartSequenceNameArg.Find(':', fourth + 1) != wxNOT_FOUND) {
+			fprintf(stderr,
+				"--force-part-sequence-name expects <ed2k-hash>:<part>:<origin-user-hash>:"
+				"<upstream-nickname-or->:<downstream-nickname-or->\n");
+			return false;
+		}
+		const wxString fileText = forcePartSequenceNameArg.Left(first);
+		const wxString partText = forcePartSequenceNameArg.Mid(first + 1, second - first - 1);
+		const wxString originText = forcePartSequenceNameArg.Mid(second + 1, third - second - 1);
+		wxString upstreamName = forcePartSequenceNameArg.Mid(third + 1, fourth - third - 1);
+		wxString downstreamName = forcePartSequenceNameArg.Mid(fourth + 1);
+		if (upstreamName == "-") {
+			upstreamName.clear();
+		}
+		if (downstreamName == "-") {
+			downstreamName.clear();
+		}
+		CMD4Hash fileHash;
+		CMD4Hash originHash;
+		long part = -1;
+		if (!fileHash.Decode(fileText) || !partText.ToLong(&part) || part < 0 || part >= 0xffff ||
+			!originHash.Decode(originText) ||
+			(part == 0 && !upstreamName.IsEmpty()) ||
+			(part > 0 && upstreamName.IsEmpty())) {
+			fprintf(stderr,
+				"relay name sequence needs S's UserHash on every node; part 0 has no upstream, "
+				"and later parts need the upstream nickname\n");
+			return false;
+		}
+		ForcePartSelection::SetSequenceByName(fileHash,
+			static_cast<uint32>(part), originHash, upstreamName, downstreamName);
+		AddLogLineNS(CFormat(LOG_PRELOCALE("Relay name sequence configured at part %u for %s\n")) %
+			static_cast<unsigned>(part) % fileText);
+		AddLogLineNS(LOG_PRELOCALE(
+			"Relay name discovery ignores source records without UserHash; obfuscated server "
+			"source replies or hashed source exchange are required\n"));
+	}
+	if (hasForcePartSequenceChain) {
+		const int first = forcePartSequenceChainArg.Find(':');
+		const int second = forcePartSequenceChainArg.Find(':', first + 1);
+		const int third = forcePartSequenceChainArg.Find(':', second + 1);
+		if (first <= 0 || second <= first + 1 || third <= second + 1 ||
+			third >= static_cast<int>(forcePartSequenceChainArg.length()) - 1 ||
+			forcePartSequenceChainArg.Find(':', third + 1) != wxNOT_FOUND) {
+			fprintf(stderr,
+				"--force-part-sequence-chain expects <ed2k-hash>:<part>:<origin-user-hash>:<nickname-base>\n");
+			return false;
+		}
+		const wxString fileText = forcePartSequenceChainArg.Left(first);
+		const wxString partText = forcePartSequenceChainArg.Mid(first + 1, second - first - 1);
+		const wxString originText = forcePartSequenceChainArg.Mid(second + 1, third - second - 1);
+		const wxString nicknameBase = forcePartSequenceChainArg.Mid(third + 1).Strip(wxString::both);
+		CMD4Hash fileHash;
+		CMD4Hash originHash;
+		long part = -1;
+		if (!fileHash.Decode(fileText) || !partText.ToLong(&part) || part < 0 || part >= 0xffff ||
+			!originHash.Decode(originText) || nicknameBase.IsEmpty() ||
+			nicknameBase.Find(':') != wxNOT_FOUND ||
+			(forcePartSequencePingPong && part > 1)) {
+			fprintf(stderr,
+				"relay chain requires valid hashes, a part in 0..65534, and a nickname base; "
+				"ping-pong mode must start at part 0 or 1\n");
+			return false;
+		}
+		ForcePartSelection::SetSequenceByBase(fileHash,
+			static_cast<uint32>(part), originHash, nicknameBase,
+			forcePartSequencePingPong, forcePartSequenceFinalFirst);
+		const uint32 localIndex = forcePartSequencePingPong
+			? static_cast<uint32>(part) % 2 : static_cast<uint32>(part);
+		AddLogLineNS(CFormat(LOG_PRELOCALE(
+			"Relay chain configured at part %u for %s; expected local nickname %s-%u\n")) %
+			static_cast<unsigned>(part) % fileText % nicknameBase % localIndex);
+		AddLogLineNS(LOG_PRELOCALE(
+			"Set this daemon's eD2k nickname to the expected local nickname; "
+			"neighbors are derived from the shared base\n"));
+		const wxString expectedLocalNickname = nicknameBase + wxString::Format("-%u", localIndex);
+		ForcePartSelection::ReportSequenceProgress(part == 0
+			? wxString(CFormat(forcePartSequenceFinalFirst
+				? "Configured as '%s'; downloading the final part first from source S"
+				: "Configured as '%s'; downloading part 0 first from source S") %
+				expectedLocalNickname)
+			: wxString(CFormat("Configured as '%s'; searching for upstream '%s'") %
+				expectedLocalNickname % (nicknameBase + wxString::Format("-%u",
+					forcePartSequencePingPong ? 1 - localIndex : part - 1))));
+	}
+	if (!forcePartRoutes.IsEmpty()) {
+		CMD4Hash routeFileHash;
+		bool haveRouteFileHash = false;
+		for (size_t i = 0; i < forcePartRoutes.size(); ++i) {
+			const wxString &route = forcePartRoutes[i];
+			const int firstSeparator = route.Find(':');
+			const int lastSeparator = route.Find(':', true);
+			if (firstSeparator <= 0 || lastSeparator <= firstSeparator ||
+				lastSeparator >= static_cast<int>(route.length()) - 1) {
+				fprintf(stderr,
+					"--force-part-route expects <ed2k-hash>:<part-number>:<user-hash>\n");
+				return false;
+			}
+
+			const wxString hashText = route.Left(firstSeparator);
+			const wxString partText =
+				route.Mid(firstSeparator + 1, lastSeparator - firstSeparator - 1);
+			const wxString userHashText = route.Mid(lastSeparator + 1);
+			CMD4Hash fileHash;
+			CMD4Hash userHash;
+			long partNumber = -1;
+			if (!fileHash.Decode(hashText) || !userHash.Decode(userHashText) ||
+				!partText.ToLong(&partNumber) || partNumber < 0 || partNumber >= 0xffff ||
+				(haveRouteFileHash && fileHash != routeFileHash)) {
+				fprintf(stderr,
+					"--force-part-route expects one file hash, valid part numbers and valid user hashes\n");
+				return false;
+			}
+
+			if (!haveRouteFileHash) {
+				routeFileHash = fileHash;
+				ForcePartSelection::SetExclusive(routeFileHash);
+				haveRouteFileHash = true;
+			}
+			ForcePartSelection::SetPartSource(routeFileHash,
+				static_cast<uint32>(partNumber),
+				userHash);
+			AddLogLineNS(CFormat(LOG_PRELOCALE("Forced part route: %s:%u:%s\n")) %
+				hashText % static_cast<unsigned>(partNumber) % userHashText);
+		}
+	}
+
+	if (hasForcePart) {
 		const int separator = forcePartArg.Find(':', true);
 		if (separator <= 0 || separator >= static_cast<int>(forcePartArg.length()) - 1) {
 			fprintf(stderr, "--force-part expects <ed2k-hash>:<part-number>\n");
@@ -525,7 +790,7 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 			static_cast<unsigned>(partNumber));
 	}
 
-	if (cmdline.Found("force-part-source", &forcePartSourceArg)) {
+	if (hasForcePartSource) {
 		const int lastSeparator = forcePartSourceArg.Find(':', true);
 		const int firstSeparator = forcePartSourceArg.Find(':');
 		if (firstSeparator <= 0 || lastSeparator <= firstSeparator ||
@@ -941,6 +1206,16 @@ bool CamuleAppCommon::InitCommon(int argc, wxChar **argv)
 
 	CPreferences::BuildItemList(thePrefs::GetConfigDir());
 	CPreferences::LoadAllItems(wxConfigBase::Get());
+	const bool hasForcePartCommandLine = hasForcePart || hasForcePartSource ||
+		hasForcePartSequence || hasForcePartSequenceName || hasForcePartSequenceChain ||
+		!forcePartRoutes.IsEmpty();
+	if (!hasForcePartCommandLine) {
+		if (ForcePartSelection::RestorePersistentSequence()) {
+			AddLogLineNS(LOG_PRELOCALE("Restored saved relay sequence from configuration\n"));
+		}
+	} else if (hasForcePartSequence || hasForcePartSequenceName || hasForcePartSequenceChain) {
+		ForcePartSelection::SavePersistentSequence();
+	}
 
 #ifdef CLIENT_GUI
 	m_skipConnectionDialog = cmdline.Found("skip");

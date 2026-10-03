@@ -233,6 +233,10 @@ public:
 	 * Sends a message to a client, identified by a GUI_ID. @return Success
 	 */
 	bool SendChatMessage(uint64 client_id, const wxString &message);
+	//! Sends a protocol message to a known peer with the specified UserHash.
+	bool SendChatMessage(const CMD4Hash &userHash, const wxString &message);
+	//! Sends to a known peer, or creates a connection using its supplied IPv4 endpoint.
+	bool SendChatMessage(const CMD4Hash &userHash, uint32 ip, uint16 port, const wxString &message);
 
 	/**
 	 * Stops a chat session with a client.

@@ -1,173 +1,123 @@
-# aMule
+# aMule Keroro
 
-![aMule](https://raw.githubusercontent.com/amule-org/amule/master/src/icons/amule.svg)
+<!-- Français -->
 
-aMule is an eMule-like client for the eDonkey and Kademlia networks.
+## Français
 
-[Forum] | [Documentation] | [FAQ]
+Fork expérimental d’aMule qui coordonne plusieurs instances pour télécharger
+un fichier partie par partie et relayer les parties vérifiées entre les nœuds.
+Il conserve le client eD2k/Kad d’aMule et ajoute des commandes relais pour
+l’interface graphique et le démon sans interface `amuled`.
 
-[Forum]:         https://github.com/amule-org/amule/discussions "aMule Forum"
-[Documentation]: https://amule-org.github.io/docs "aMule Documentation"
-[FAQ]:           https://amule-org.github.io/docs/manual/faq "FAQ on aMule"
+### Mode relais
 
-## Important Notice
+Chaque nœud utilise le même hash de fichier, le UserHash eD2k de la source S et
+une base de pseudonyme partagée. Le numéro du nœud indique sa place dans la
+séquence. Les nœuds découvrent leurs voisins à partir de leur pseudonyme,
+récupèrent les parties vérifiées nécessaires et les transmettent via eD2k. Le
+hash de S limite à cette source les parties qui lui sont attribuées.
 
-The work in aMule will continue in the new [aMule-org repo](https://github.com/amule-org/amule). The reason we had to create a new organization is that Gonosztopi, who is the single owner of [aMule Project](https://github.com/amule-project), has been unreachable. As a result, in the **aMule-project** organization we became unable to update the infrastructure to the project's needs.
+Par défaut, chaque numéro de séquence correspond à la partie de fichier portant
+le même numéro. L’option « final-first » télécharge d’abord la dernière partie,
+puis les parties `0, 1, 2, ...`. Le mode ping-pong à deux nœuds alterne le
+travail entre des démons dont les pseudonymes se terminent par `-0` et `-1`. Une
+partie est relayée après sa réception et sa vérification locales.
 
-## Overview
+Dans l’interface graphique, configurez le relais dans la boîte de dialogue
+**Force Part**. Sélectionnez une partie, choisissez une source connue ou
+saisissez le UserHash de S, indiquez la base de pseudonyme et cochez les options
+souhaitées.
 
-aMule is a multi-platform client for the eD2k / Kad file-sharing network,
-originally a fork of the Windows client eMule (via xMule and lMule).
-aMule started in August 2003.
+Pour lancer une séquence sans interface, utilisez `amuled` :
 
-Supported platforms today: Linux, FreeBSD, OpenBSD, NetBSD, macOS, and
-Windows (MSYS2 / mingw-w64), on both x86_64 and ARM64.
+```sh
+amuled --force-part-sequence-chain \
+  '<hash-ed2k-du-fichier>:<étape>:<userhash-de-S>:<base-de-pseudonyme>'
+```
 
-aMule aims to stay close to eMule in look-and-feel so users moving between
-the two have minimal friction. New eMule protocol-level features are
-generally adopted into aMule shortly after.
+Ajoutez `--force-part-sequence-pingpong` sur les deux démons pour le mode à deux
+nœuds ; le premier démarre à l’étape `0`, le second à l’étape `1`. Ajoutez
+`--force-part-sequence-final-first` sur chaque nœud pour télécharger la dernière
+partie en premier. Tous les nœuds doivent utiliser des versions compatibles et
+les mêmes paramètres de séquence.
 
----
+### Compilation
 
-| | Distributions | |
-| --- | --- | --- |
-| [![Arch Linux](https://repology.org/badge/version-for-repo/arch/amule.svg)](https://archlinux.org/packages/extra/x86_64/amule/) | [![AUR](https://repology.org/badge/version-for-repo/aur/amule.svg?allow_ignored=1)](https://aur.archlinux.org/packages/amule) | [![Debian 11](https://repology.org/badge/version-for-repo/debian_11/amule.svg)](https://repology.org/project/amule/versions) |
-| [![Debian 12](https://repology.org/badge/version-for-repo/debian_12/amule.svg)](https://repology.org/project/amule/versions) | [![Debian 13](https://repology.org/badge/version-for-repo/debian_13/amule.svg)](https://repology.org/project/amule/versions) | [![Debian 14](https://repology.org/badge/version-for-repo/debian_14/amule.svg)](https://repology.org/project/amule/versions) |
-| [![Debian Unstable](https://repology.org/badge/version-for-repo/debian_unstable/amule.svg)](https://repology.org/project/amule/versions) | [![Fedora 44 package](https://repology.org/badge/version-for-repo/fedora_44/amule.svg)](https://repology.org/project/amule/versions) | [![Fedora Rawhide package](https://repology.org/badge/version-for-repo/fedora_rawhide/amule.svg)](https://repology.org/project/amule/versions) |
-| [![FreeBSD](https://repology.org/badge/version-for-repo/freebsd/amule.svg)](https://www.freshports.org/net-p2p/amule/) | [![Gentoo](https://repology.org/badge/version-for-repo/gentoo/amule.svg)](https://packages.gentoo.org/packages/net-p2p/amule) | [![Kali Linux](https://repology.org/badge/version-for-repo/kali_rolling/amule.svg)](https://pkg.kali.org/pkg/amule) |
-| [![Manjaro](https://repology.org/badge/version-for-repo/manjaro_stable/amule.svg)](https://repology.org/project/amule/versions) | [![NixOS 25.05](https://repology.org/badge/version-for-repo/nix_stable_25_05/amule.svg)](https://search.nixos.org/packages?channel=25.05&query=amule) | [![OpenBSD](https://repology.org/badge/version-for-repo/openbsd/amule.svg)](https://openports.pl/path/net/amule) |
-| [![openSUSE Tumbleweed (Packman)](https://repology.org/badge/version-for-repo/packman_opensuse_tumbleweed/amule.svg)](http://packman.links2linux.org/package/aMule) | [![Slackware](https://repology.org/badge/version-for-repo/slackbuilds/amule.svg)](https://slackbuilds.org/result/?search=amule) | [![Solus](https://repology.org/badge/version-for-repo/solus/amule.svg)](https://repology.org/project/amule/versions) |
-| [![Ubuntu 22.04 LTS](https://repology.org/badge/version-for-repo/ubuntu_22_04/amule.svg)](https://repology.org/project/amule/versions) | [![Ubuntu 24.04 LTS](https://repology.org/badge/version-for-repo/ubuntu_24_04/amule.svg)](https://packages.ubuntu.com/noble/amule) | [![Ubuntu 25.04](https://repology.org/badge/version-for-repo/ubuntu_25_04/amule.svg)](https://packages.ubuntu.com/plucky/amule) |
-| [![Ubuntu 25.10](https://repology.org/badge/version-for-repo/ubuntu_25_10/amule.svg)](https://repology.org/project/amule/versions) | [![Ubuntu 26.04 LTS](https://repology.org/badge/version-for-repo/ubuntu_26_04/amule.svg)](https://repology.org/project/amule/versions) | [![Ubuntu 26.10](https://repology.org/badge/version-for-repo/ubuntu_26_10/amule.svg)](https://repology.org/project/amule/versions) |
-
----
-
-## Development Statistics
-
-| aMule-project (frozen) | [aMule-org](https://github.com/amule-org/amule) |
-| ---------------------- | --------- |
-| [![Open Pull Requests](https://img.shields.io/github/issues-pr/amule-project/amule)](https://github.com/amule-project/amule/pulls) | [![Open Pull Requests](https://img.shields.io/github/issues-pr/amule-org/amule)](https://github.com/amule-org/amule/pulls) |
-| [![Open Issues](https://img.shields.io/github/issues/amule-project/amule)](https://github.com/amule-project/amule/issues) | [![Open Issues](https://img.shields.io/github/issues/amule-org/amule)](https://github.com/amule-org/amule/issues) |
-| [![Bug](https://img.shields.io/github/issues/amule-project/amule/bug)](https://github.com/amule-project/amule/issues?q=is%3Aopen+is%3Aissue+label%3Abug) | [![Bug](https://img.shields.io/github/issues/amule-org/amule/bug)](https://github.com/amule-org/amule/issues?q=is%3Aopen+is%3Aissue+label%3Abug) |
-| [![Feature Request](https://img.shields.io/github/issues/amule-project/amule/feature%20request)](https://github.com/amule-project/amule/issues?labels=feature+request) | [![Feature Request](https://img.shields.io/github/issues/amule-org/amule/feature%20request)](https://github.com/amule-org/amule/issues?labels=feature+request) |
-| [![Enhancement](https://img.shields.io/github/issues/amule-project/amule/enhancement)](https://github.com/amule-project/amule/issues?labels=enhancement) | [![Enhancement](https://img.shields.io/github/issues/amule-org/amule/enhancement)](https://github.com/amule-org/amule/issues?labels=enhancement) |
-
-## Features
-
-* `amule` — all-in-one GUI client.
-* `amuled` — headless daemon, no GUI.
-* `amulegui` — remote GUI; connects to a local or remote `amuled` over the
-  EC (External Connection) protocol.
-* `amuleweb` — HTTP interface to a running `amuled`.
-* `amulecmd` — interactive CLI for a running `amuled`.
-* `amuleapi` — REST API for a running `amuled`.
-
-## Installation
-
-aMule ships pre-built binaries for every major desktop system. Building from
-source is also supported.
-
-### Pre-built binaries (recommended)
-
-Download the latest release for your platform from the
-[Releases page]. Quick start:
-
-* **Linux**
-  * Flatpak: `flatpak install ./appname.flatpak`
-  * AppImage: `chmod +x` and run
-  * Static tarball (headless, x64 / arm64): unpack and run — `amuled`, `amulecmd` and `amuleapi` with no shared-library dependencies, Web UI included
-* **macOS** — Universal2 `.dmg`: download, drag to `/Applications`.
-* **Windows** — choose either the **NSIS installer** `.exe` (Start-menu shortcuts, uninstaller, x64 / ARM64) or the **portable `.zip`** (no install, unzip and run).
-
-See [docs/INSTALL_BINARIES.md](docs/INSTALL_BINARIES.md) for
-per-platform notes — including the macOS unsigned-binary
-workaround, the Windows SmartScreen prompt, the Linux FUSE
-dependency for AppImage, and what the static tarball contains.
-
-[Releases page]: https://github.com/amule-org/amule/releases/latest
-
-### Building from source
-
-aMule uses CMake. Quick start:
+Le projet utilise CMake. Sous Linux, installez les dépendances de compilation
+d’aMule, puis lancez :
 
 ```sh
 cmake -B build -DBUILD_MONOLITHIC=YES -DBUILD_REMOTEGUI=YES
 cmake --build build -j"$(nproc)"
-sudo cmake --install build
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) for the full list of dependencies,
-build options (`BUILD_DAEMON`, `BUILD_AMULECMD`, `ENABLE_NLS`, `ENABLE_UPNP`,
-`ENABLE_IP2COUNTRY`, etc.), and platform-specific notes. The CI workflow
-[`.github/workflows/ccpp.yml`](.github/workflows/ccpp.yml) is the
-authoritative reference for the exact deps and flags used to build aMule
-on Linux, macOS, and Windows.
+Pour compiler sous Windows, utilisez l’environnement MSYS2 `CLANG64` et les
+scripts de packaging Windows du projet. Après toute modification du protocole
+relais, recompilez chaque nœud avant de tester un transfert.
 
-## Setting Up
+### État du projet
 
-aMule comes with reasonable default settings and should be usable as-is.
-Two configuration steps are still worth doing on day one.
+Il s’agit d’un fork expérimental propre à ce projet. Le relais a été essayé
+entre des démons Linux et Windows, mais toute nouvelle modification du protocole
+doit être validée avec les versions exactes déployées sur les nœuds.
 
-### Open the ports — get a HighID
+---
 
-To receive a [HighID] you need to open aMule's ports on your firewall
-and/or forward them on your router. See the [network connectivity
-guide][network] for details.
+<!-- English -->
 
-[HighID]:  https://amule-org.github.io/docs/p2p-networks/ed2k/high-id "What is LowID and HighID?"
-[network]: https://amule-org.github.io/docs/manual/configuration/network-connectivity "Network connectivity"
+## English
 
-### Set bandwidth limits
+An experimental aMule fork that coordinates multiple aMule instances to
+download a file part by part and relay verified parts between nodes. It keeps
+aMule's eD2k/Kad client and adds relay controls for both the GUI and the
+headless `amuled` daemon.
 
-aMule ships with both upload and download caps disabled by default
-(`MaxUpload=0`, `MaxDownload=0` — both interpreted as literal
-unlimited). On a connection that aMule can saturate, that means
-aMule will eat all the bandwidth available to it, starving every
-other application sharing the link. **Setting realistic limits is
-strongly recommended.**
+### Relay mode
 
-Under `Preferences → Connection`, set the limits to roughly **80 %
-of your actual line speed** to avoid saturating the upstream and
-starving your own traffic. Values are in **kibibytes per second**
-(KiB/s, units of 1024 bytes); ISP advertised speeds are usually in
-**megabits per second** (Mbps). To convert, multiply Mbps by **122**.
+Each node is configured with the same file hash, origin S's eD2k UserHash, and
+shared nickname base. The node number identifies its place in the sequence.
+Nodes discover adjacent relays by nickname, fetch the required verified parts,
+and pass them on using eD2k transfers. The origin hash restricts the source
+used for parts assigned to S.
 
-> Example: a 100 Mbps / 20 Mbps fibre line → roughly 12 200 KiB/s
-> downstream and 2 440 KiB/s upstream. Set the limits to about
-> 9 800 down / 1 950 up to stay below the line cap.
+The default order maps each sequence number to the corresponding file part.
+Optional final-first order downloads the last part first, followed by parts
+`0, 1, 2, ...`. Two-node ping-pong mode alternates relay work between daemons
+named with the `-0` and `-1` suffixes. A part is relayed after it has been
+received and verified locally.
 
-## Reporting Bugs
+In the GUI, configure this in the **Force Part** dialog. Select a file part,
+choose a known source or enter S's UserHash, set the shared nickname base, and
+select the desired relay options.
 
-If you find a bug or miss a feature, please open an issue on
-[GitHub][5] (preferred) or report it on the [forum]. A good bug report
-includes the exact aMule version (`amuled --version`), the platform you're
-on, and steps to reproduce. See the [bug report guide][bug-report] for
-detailed instructions on attaching backtraces and reproducer steps.
+For headless operation, start a sequence with `amuled`:
 
-[5]:          https://github.com/amule-org/amule/issues "aMule Issues"
-[bug-report]: https://amule-org.github.io/docs/contributing/bug-report "Bug Report Instructions"
+```sh
+amuled --force-part-sequence-chain \
+  '<file-ed2k-hash>:<sequence-step>:<origin-user-hash>:<nickname-base>'
+```
 
-## Contributing
+Add `--force-part-sequence-pingpong` on both daemons for two-node operation;
+the first daemon starts at step `0`, the second at step `1`. Add
+`--force-part-sequence-final-first` on every node to use the final-first order.
+All nodes must use compatible builds and the same sequence settings.
 
-*Contributions are always welcome!*
+### Build
 
-See the [contributing guide][contributing] for how to get involved. In short:
+The project uses CMake. On Linux, install the required aMule build dependencies,
+then run:
 
-* **Code** — fix a bug, implement a feature, improve performance. The preferred
-  path is a [pull request][6] on GitHub; patches on the [forum] also work.
-* **Translation** — translate aMule, its documentation, or its website into
-  your language.
-* **Documentation** — help improve the project documentation at
-  [amule-org.github.io/docs][Documentation].
+```sh
+cmake -B build -DBUILD_MONOLITHIC=YES -DBUILD_REMOTEGUI=YES
+cmake --build build -j"$(nproc)"
+```
 
-[6]:            https://github.com/amule-org/amule/pulls "aMule Pull Requests"
-[contributing]: https://amule-org.github.io/docs/contributing "Contributing to aMule"
+For a Windows build, use the MSYS2 `CLANG64` environment and the project's
+Windows packaging scripts. Relay protocol changes should be rebuilt on every
+participating node before testing a transfer.
 
-## Translations
+### Status
 
-The translations of the application interface and the man pages live in this
-repository and can be edited either by opening a pull request — see the
-[Translations guide](https://amule-org.github.io/docs/developer/translations) —
-or through [Weblate](https://hosted.weblate.org/projects/amule/), a translation
-tool that stays in sync with git — see the
-[Weblate guide](https://amule-org.github.io/docs/developer/translations/weblate).
+This is a project-specific experimental fork. The relay workflow has been
+exercised between Linux and Windows daemons, but each new protocol change still
+needs validation with the exact builds deployed on all nodes.

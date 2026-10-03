@@ -82,16 +82,19 @@ public:
 	uint64 end;                    // This is the end offset of the data
 	Requested_Block_Struct *block; // This is the requested block that this data relates to
 	uint8 flushed;                 // eMule ref: 0=ready 1=pending 2=error 3=written
+	CMD4Hash userHash;             // Source peer that supplied this buffered data
 
 	PartFileBufferedData(CFileAutoClose &file,
 		uint8_t *data,
 		uint64 _start,
 		uint64 _end,
-		Requested_Block_Struct *_block)
+		Requested_Block_Struct *_block,
+		const CMD4Hash &_userHash)
 	: start(_start)
 	, end(_end)
 	, block(_block)
 	, flushed(0)
+	, userHash(_userHash)
 	{
 		area.StartWriteAt(file, start, end - start + 1);
 		memcpy(area.GetBuffer(), data, end - start + 1);
@@ -150,6 +153,11 @@ public:
 
 	bool IsComplete(uint64 start, uint64 end) { return m_gaplist.IsComplete(start, end); }
 	bool IsComplete(uint16 part) { return m_gaplist.IsComplete(part); }
+	bool IsPartVerified(uint16 part)
+	{
+		return part < GetPartCount() && IsComplete(part) &&
+			m_changedPartVerified.size() == GetPartCount() && m_changedPartVerified[part];
+	}
 
 	void UpdateCompletedInfos();
 
@@ -396,6 +404,8 @@ private:
 	uint8 status;
 	uint64 lastpurgetime;
 	uint64 m_LastNoNeededCheck;
+	// Retry A4AF swaps quickly while a relay sequence is waiting on a scheduled part.
+	uint64 m_LastRelayA4AFSwapTick = 0;
 	CGapList m_gaplist;
 	CReqBlockPtrList m_requestedblocks_list;
 	double percentcompleted;
@@ -415,6 +425,8 @@ private:
 	uint64 m_nLastBufferFlushTime;
 	std::atomic<int32> m_iWrites; // eMule ref: count of items queued to write thread (not yet PB_WRITTEN)
 	std::vector<bool> m_aChangedPart; // eMule ref: persistent tracking of parts needing hash verification
+	std::vector<CMD4Hash> m_changedPartSource; // Keroro: source peer for each dirty part
+        std::vector<bool> m_changedPartVerified; // Keroro: part passed hash verification since its last write
 
 	// GetTickCount() at last WriteToBuffer; FlushBuffer's Phase 3
 	// quiescent guard reads this to defer hashing during active receive.

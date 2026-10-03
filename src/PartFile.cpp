@@ -425,6 +425,7 @@ CPartFile::~CPartFile()
 					if (IsCorruptedPart(i)) {
 						EraseFirstValue(m_corrupted_list, i);
 					}
+                                        m_changedPartVerified[i] = true;
 					++verified;
 				} else {
 					// Part is bad. Re-open the gap and record in m_corrupted_list so the
@@ -434,6 +435,7 @@ CPartFile::~CPartFile()
 						m_corrupted_list.push_back(i);
 					}
 					m_iLostDueToCorruption += (uint64)GetPartSize(i);
+                                        m_changedPartVerified[i] = false;
 					++corrupt;
 				}
 			}
@@ -880,8 +882,10 @@ uint8 CPartFile::LoadPartFile(
 		return true;
 	} else {
 		m_hashsetneeded = false;
+		m_changedPartVerified.assign(GetPartCount(), false);
 		for (size_t i = 0; i < m_hashlist.size(); ++i) {
 			if (IsComplete(i)) {
+				m_changedPartVerified[i] = true;
 				SetStatus(PS_READY);
 			}
 		}
@@ -1565,7 +1569,9 @@ void CPartFile::WritePartStatus(CMemFile *file)
 	while (done != parts) {
 		uint8 towrite = 0;
 		for (uint32 i = 0; i != 8; ++i) {
-			if (IsComplete(done)) {
+			const bool relayVerified = !ForcePartSelection::IsSequenceConfigured(GetFileHash()) ||
+				GetStatus() == PS_COMPLETE || IsPartVerified(done);
+			if (IsComplete(done) && relayVerified) {
 				towrite |= (1 << i);
 			}
 			++done;
@@ -1584,6 +1590,16 @@ void CPartFile::WriteCompleteSourcesCount(CMemFile *file)
 
 uint32 CPartFile::Process(uint8 m_icounter)
 {
+	// A forced-part selection is also a request to prioritize its target file. This
+	// runs here as well as in the GUI dialog because CLI options can be parsed before
+	// the corresponding part file has been loaded into the download queue.
+	if (ForcePartSelection::IsActive() &&
+		ForcePartSelection::GetFileHash() == GetFileHash() &&
+		(IsAutoDownPriority() || GetDownPriority() != PR_HIGH)) {
+		SetAutoDownPriority(false);
+		SetDownPriority(PR_HIGH);
+	}
+
 	// Partfiles have ~20 EC-exported fields that change frequently and independently.
 	// Per-field hooks have diminishing returns when the file is actively transferring
 	// anyway, so the mark here stays coarse -- but it is not unconditional. "Process() ran"
@@ -1636,6 +1652,260 @@ uint32 CPartFile::Process(uint8 m_icounter)
 		(dwCurTick > (m_nLastBufferFlushTime + BUFFER_TIME_LIMIT)) || HasPendingHashWork()) {
 		FlushBuffer();
 	}
+	if (ForcePartSelection::IsSequenceConfigured(GetFileHash())) {
+		ForcePartSelection::InitializeSequencePartOrder(GetFileHash(), GetPartCount());
+		const uint32 stagePart = ForcePartSelection::GetSequencePart();
+		const uint32 sourcePart = ForcePartSelection::GetSequenceFilePart(GetPartCount(), stagePart);
+		// A relay part may be available from a source parked as A4AF on another
+		// download. Mirror the extended-menu "swap to this file" action automatically
+		// and retry periodically for sources that are temporarily busy.
+		if (!ForcePartSelection::IsSequenceStageFinished(GetFileHash()) &&
+			(ForcePartSelection::IsSequenceWaitingForPrefix(GetFileHash()) ||
+				!IsPartVerified(static_cast<uint16>(sourcePart))) &&
+			!m_A4AFsrclist.empty() &&
+			(!m_LastRelayA4AFSwapTick || dwCurTick - m_LastRelayA4AFSwapTick >= 5000)) {
+			m_LastRelayA4AFSwapTick = dwCurTick;
+			uint32 swappedSources = 0;
+			for (SourceSet::iterator it = m_A4AFsrclist.begin(); it != m_A4AFsrclist.end();) {
+				CUpDownClient *source = it++->GetClient();
+				if (source && source->SwapToAnotherFile(true, false, false, this)) {
+					++swappedSources;
+				}
+			}
+			if (swappedSources) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay moved %u A4AF source(s) to the target file\n")) % swappedSources);
+			}
+		}
+		const uint32 localIndex = ForcePartSelection::IsSequencePingPong()
+			? stagePart % 2 : stagePart;
+		const wxString expectedLocalNickname = ForcePartSelection::GetSequenceNicknameBase() +
+			wxString::Format("-%u", localIndex);
+		if (!ForcePartSelection::ValidateSequenceLocalNickname(
+				GetFileHash(), thePrefs::GetUserNick())) {
+			thePrefs::SetUserNick(expectedLocalNickname);
+			if (theApp->glob_prefs != nullptr) {
+				theApp->glob_prefs->Save();
+			}
+			AddLogLineC(CFormat("Relay chain set this daemon's nickname to '%s'") %
+				expectedLocalNickname);
+			ForcePartSelection::ReportSequenceProgress(CFormat(
+				"Configured this instance as '%s'") % expectedLocalNickname);
+		} else if (stagePart >= GetPartCount()) {
+			AddLogLineC(CFormat("Relay stage %u is outside file '%s' (%u parts); sequence cancelled") %
+				stagePart % GetFileName() % GetPartCount());
+			ForcePartSelection::Clear();
+		} else if (ForcePartSelection::IsSequenceByName() &&
+			!ForcePartSelection::IsSequencePingPong() && stagePart + 1 >= GetPartCount()) {
+			ForcePartSelection::MarkSequenceFinalStage(GetFileHash());
+		}
+		if (ForcePartSelection::IsSequenceConfigured(GetFileHash()) &&
+			ForcePartSelection::IsSequenceWaitingForPrefix(GetFileHash())) {
+			bool prefixVerified = true;
+			for (uint32 step = 0; step < stagePart; ++step) {
+				const uint32 part = ForcePartSelection::GetSequenceFilePart(GetPartCount(), step);
+				if (!IsPartVerified(static_cast<uint16>(part))) {
+					prefixVerified = false;
+					break;
+				}
+			}
+			if (prefixVerified && ForcePartSelection::IsSequenceUpstreamConfirmed()) {
+				ForcePartSelection::StartSequenceOrigin(GetFileHash());
+				ApplyForcedPartSelection();
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay prefix through part %u verified; requesting part %u from origin\n")) %
+					ForcePartSelection::GetSequenceFilePart(GetPartCount(), stagePart - 1) %
+					ForcePartSelection::GetSequenceFilePart(GetPartCount(), stagePart));
+				ForcePartSelection::ReportSequenceProgress(CFormat(
+					"Previous relay part %u verified; now requesting part %u from source S") %
+					ForcePartSelection::GetSequenceFilePart(GetPartCount(), stagePart - 1) % sourcePart);
+			}
+		}
+	}
+	if (ForcePartSelection::IsSequenceOriginStarted(GetFileHash())) {
+		const uint32 stagePart = ForcePartSelection::GetSequencePart();
+		const uint32 sourcePart = ForcePartSelection::GetSequenceFilePart(GetPartCount(), stagePart);
+		if (IsPartVerified(static_cast<uint16>(sourcePart))) {
+			const bool firstCompletion = !ForcePartSelection::IsSequenceStageFinished(GetFileHash());
+			ForcePartSelection::FinishSequencePart(GetFileHash());
+			if (firstCompletion && !ForcePartSelection::GetSequenceOrigin().IsEmpty()) {
+				const CClientList::SourceList originClients = theApp->clientlist->GetClientsByHash(
+					ForcePartSelection::GetSequenceOrigin());
+				for (CClientList::SourceList::const_iterator it = originClients.begin();
+					it != originClients.end(); ++it) {
+					CUpDownClient *origin = it->GetClient();
+					if (!origin || origin->GetRequestFile() != this) {
+						continue;
+					}
+					if (origin->GetSocket()) {
+						const bool deleted = origin->Disconnected(
+							"Relay stage complete; closing origin connection");
+						if (deleted || !ForcePartSelection::IsSequencePingPong()) {
+							origin->Safe_Delete();
+							continue;
+						}
+					}
+					if (!ForcePartSelection::IsSequencePingPong() &&
+						!origin->HasBeenDeleted() && origin->GetRequestFile() == this) {
+						RemoveSource(origin, false, false);
+					}
+				}
+				AddLogLineNS(LOG_PRELOCALE("Relay origin connection closed after part verification\n"));
+			const bool finalStage = stagePart + 1 >= GetPartCount();
+			ForcePartSelection::ReportSequenceProgress(finalStage
+				? CFormat("Final scheduled part %u verified; the complete file is ready for distribution") % sourcePart
+				: CFormat("Part %u verified; disconnected from source S and waiting for the next relay node") %
+					sourcePart);
+			}
+		}
+		if (ForcePartSelection::ShouldSendSequenceAck(GetFileHash(), dwCurTick)) {
+			const wxString ack = CFormat("KRLY1|ACK|%s|%u") % GetFileHash().Encode() %
+				(stagePart - 1);
+			if (theApp->clientlist->SendChatMessage(
+					ForcePartSelection::GetSequenceUpstream(),
+					ForcePartSelection::GetSequenceUpstreamCandidateIP(),
+					ForcePartSelection::GetSequenceUpstreamCandidatePort(),
+					ack)) {
+				ForcePartSelection::MarkSequenceAckQueued(GetFileHash());
+			} else {
+				AddDebugLogLineN(logPartFile,
+					"Relay upstream is not a known chat contact yet; will retry ACK");
+			}
+		}
+		if (ForcePartSelection::ShouldSendSequenceOffer(GetFileHash(), dwCurTick)) {
+			const wxString offer = ForcePartSelection::IsSequenceByName()
+				? wxString(CFormat("KRLY1|OFFER|%s|%u|%s") % GetFileHash().Encode() % stagePart %
+					ForcePartSelection::GetSequenceOrigin().Encode())
+				: wxString(CFormat("KRLY1|OFFER|%s|%u") % GetFileHash().Encode() % stagePart);
+			if (!theApp->clientlist->SendChatMessage(
+					ForcePartSelection::GetSequenceDownstream(),
+					ForcePartSelection::GetSequenceDownstreamIP(),
+					ForcePartSelection::GetSequenceDownstreamPort(),
+					offer)) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay OFFER could not be queued for downstream UserHash %s; will retry\n")) %
+					ForcePartSelection::GetSequenceDownstream().Encode());
+			} else {
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Relay OFFER queued for downstream UserHash %s (schedule step %u, file part %u)\n")) %
+					ForcePartSelection::GetSequenceDownstream().Encode() % stagePart % sourcePart);
+			}
+		}
+	}
+	if ((ForcePartSelection::IsSequencePingPong() ||
+		ForcePartSelection::IsSequenceFinalPartFirst()) &&
+		ForcePartSelection::IsSequenceConfigured(GetFileHash())) {
+		const uint32 stageStep = ForcePartSelection::GetSequencePart();
+		const uint32 sourcePart = ForcePartSelection::GetSequenceFilePart(GetPartCount(), stageStep);
+		if (stageStep > 0 && IsPartVerified(static_cast<uint16>(sourcePart)) &&
+			ForcePartSelection::ShouldSendSequenceBackfill(GetFileHash(), stageStep, dwCurTick)) {
+			const wxString backfill = CFormat("KRLY1|BACKFILL|%s|%u") %
+				GetFileHash().Encode() % stageStep;
+			if (theApp->clientlist->SendChatMessage(
+					ForcePartSelection::GetSequenceBackfillPeer(),
+					ForcePartSelection::GetSequenceBackfillPeerIP(),
+					ForcePartSelection::GetSequenceBackfillPeerPort(), backfill)) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay backfill file part %u (schedule step %u) announced upstream\n")) %
+					sourcePart % stageStep);
+			}
+		}
+	} else if (ForcePartSelection::IsSequenceConfigured(GetFileHash()) &&
+		ForcePartSelection::GetSequencePart() > 0) {
+		const uint32 stagePart = ForcePartSelection::GetSequencePart();
+		for (uint32 part = stagePart; part < GetPartCount(); ++part) {
+			if (part + 1 == GetPartCount() ||
+				!IsPartVerified(static_cast<uint16>(part)) ||
+				!ForcePartSelection::ShouldSendSequenceBackfill(GetFileHash(), part, dwCurTick)) {
+				continue;
+			}
+			const wxString backfill = CFormat("KRLY1|BACKFILL|%s|%u") %
+				GetFileHash().Encode() % part;
+			if (theApp->clientlist->SendChatMessage(
+					ForcePartSelection::GetSequenceBackfillPeer(),
+					ForcePartSelection::GetSequenceBackfillPeerIP(),
+					ForcePartSelection::GetSequenceBackfillPeerPort(),
+					backfill)) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay backfill part %u announced to upstream\n")) % part);
+			} else if (part + 1 == GetPartCount()) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay final backfill part %u could not be announced to paired node; file will still complete\n")) % part);
+			}
+			break;
+		}
+	}
+	if (ForcePartSelection::IsSequenceConfigured(GetFileHash())) {
+		const uint32 expectedBackfillStep = ForcePartSelection::GetSequencePart() + 1;
+		const uint32 expectedBackfillFilePart = ForcePartSelection::GetSequenceFilePart(
+			GetPartCount(), expectedBackfillStep);
+		if (expectedBackfillStep < GetPartCount() &&
+			IsPartVerified(static_cast<uint16>(expectedBackfillFilePart)) &&
+			ForcePartSelection::ShouldAcknowledgeSequenceBackfill(
+				GetFileHash(), expectedBackfillStep, dwCurTick)) {
+			const wxString ack = CFormat("KRLY1|BACKFILL_ACK|%s|%u") %
+				GetFileHash().Encode() % expectedBackfillStep;
+			const CMD4Hash &backfillAckPeer = ForcePartSelection::IsSequencePingPong()
+				? ForcePartSelection::GetSequenceBackfillPeer()
+				: ForcePartSelection::GetSequenceDownstream();
+			const uint32 backfillAckIP = ForcePartSelection::IsSequencePingPong()
+				? ForcePartSelection::GetSequenceBackfillPeerIP()
+				: ForcePartSelection::GetSequenceDownstreamIP();
+			const uint16 backfillAckPort = ForcePartSelection::IsSequencePingPong()
+				? ForcePartSelection::GetSequenceBackfillPeerPort()
+				: ForcePartSelection::GetSequenceDownstreamPort();
+			if (theApp->clientlist->SendChatMessage(
+					backfillAckPeer, backfillAckIP, backfillAckPort, ack)) {
+				ForcePartSelection::MarkSequenceBackfillAcknowledgedLocally(
+					GetFileHash(), expectedBackfillStep);
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay backfill file part %u (schedule step %u) verified and acknowledged\n")) %
+					expectedBackfillFilePart % expectedBackfillStep);
+			}
+		}
+	}
+	if (ForcePartSelection::IsSequencePingPong() &&
+		ForcePartSelection::IsSequenceConfigured(GetFileHash())) {
+		const uint32 peerStep = ForcePartSelection::GetSequencePart() + 1;
+		const uint32 peerPart = ForcePartSelection::GetSequenceFilePart(GetPartCount(), peerStep);
+		if (peerStep < GetPartCount() && IsPartVerified(static_cast<uint16>(peerPart)) &&
+			ForcePartSelection::AdvanceSequencePingPong(GetFileHash(), peerPart, GetPartCount())) {
+			ApplyForcedPartSelection();
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Relay ping-pong received file part %u; requesting file part %u from source S\n")) %
+				peerPart % ForcePartSelection::GetSequenceFilePart(
+					GetPartCount(), ForcePartSelection::GetSequencePart()));
+			ForcePartSelection::ReportSequenceProgress(CFormat(
+				"Received file part %u from the paired node; now requesting part %u from source S") %
+				peerPart % ForcePartSelection::GetSequenceFilePart(
+					GetPartCount(), ForcePartSelection::GetSequencePart()));
+			const CClientList::SourceList originClients = theApp->clientlist->GetClientsByHash(
+				ForcePartSelection::GetSequenceOrigin());
+			for (CClientList::SourceList::const_iterator it = originClients.begin();
+				it != originClients.end(); ++it) {
+				CUpDownClient *origin = it->GetClient();
+				if (origin && origin->GetRequestFile() == this) {
+					origin->ResetLastAskedTime();
+				}
+			}
+		}
+	}
+#ifdef AMULE_DAEMON
+	if (ForcePartSelection::IsSequenceDownstreamAcknowledged(GetFileHash())) {
+		bool completePrefix = true;
+		for (uint32 part = 0; part < GetPartCount(); ++part) {
+			if (!IsPartVerified(static_cast<uint16>(part))) {
+				completePrefix = false;
+				break;
+			}
+		}
+		if (completePrefix) {
+			AddLogLineNS(LOG_PRELOCALE("Relay backfill complete; shutting down daemon\n"));
+			theApp->ExitMainLoop();
+			return 0;
+		}
+	}
+#endif
 
 	// check if we want new sources from server --> MOVED for 16.40 version
 	old_trans = transferingsrc;
@@ -1659,9 +1929,72 @@ uint32 CPartFile::Process(uint8 m_icounter)
 		// Update all sources, including downloading ones. Copied to a temporary
 		// vector to prevent iterator invalidation, as above.
 		std::vector<CClientRef> temp_list(m_SrcList.begin(), m_SrcList.end());
+		bool probedRelayCandidate = false;
+		// Prefer a source whose nickname is already known over anonymous source
+		// records. Otherwise the first nameless client in CONNECTING state can
+		// monopolize this scan and hide the configured relay peer later in the list.
+		if (ForcePartSelection::IsSequenceByName()) {
+			const wxString expectedUpstream = ForcePartSelection::GetSequenceUpstreamName();
+			for (CClientRef &ref : temp_list) {
+				CUpDownClient *cur_src = ref.GetClient();
+				if (!cur_src || cur_src->GetUserName() != expectedUpstream ||
+					!ForcePartSelection::CanProbeSequenceUpstream(
+						GetFileHash(), cur_src->GetUserHash())) {
+					continue;
+				}
+				const bool newlyDiscovered = ForcePartSelection::SetSequenceUpstreamCandidate(
+					GetFileHash(), cur_src->GetUserHash(), cur_src->GetIP(), cur_src->GetUserPort());
+				probedRelayCandidate = true;
+				if (newlyDiscovered) {
+					AddLogLineNS(CFormat(LOG_PRELOCALE(
+						"Relay upstream '%s' discovered by UserHash %s\n")) %
+						cur_src->GetUserName() % cur_src->GetUserHash().Encode());
+					ForcePartSelection::ReportSequenceProgress(CFormat(
+						"Found upstream '%s'; requesting the verified prefix") %
+						cur_src->GetUserName());
+				}
+				break;
+			}
+		}
 		for (CClientRef &ref : temp_list) {
 			CUpDownClient *cur_src = ref.GetClient();
 			if (!cur_src) {
+				continue;
+			}
+			if (!probedRelayCandidate && ForcePartSelection::CanProbeSequenceUpstream(
+					GetFileHash(), cur_src->GetUserHash())) {
+				if (cur_src->GetUserName() == ForcePartSelection::GetSequenceUpstreamName()) {
+					const bool newlyDiscovered = ForcePartSelection::SetSequenceUpstreamCandidate(
+						GetFileHash(), cur_src->GetUserHash(), cur_src->GetIP(), cur_src->GetUserPort());
+					probedRelayCandidate = true;
+					if (newlyDiscovered) {
+						AddLogLineNS(CFormat(LOG_PRELOCALE(
+							"Relay upstream '%s' discovered by UserHash %s\n")) %
+							cur_src->GetUserName() % cur_src->GetUserHash().Encode());
+						ForcePartSelection::ReportSequenceProgress(CFormat(
+							"Found upstream '%s'; requesting the verified prefix") %
+							cur_src->GetUserName());
+					}
+				} else if (cur_src->GetUserName().IsEmpty() &&
+					cur_src->GetDownloadState() != DS_ERROR &&
+					cur_src->GetDownloadState() != DS_BANNED &&
+					cur_src->GetDownloadState() != DS_CONNECTING &&
+					cur_src->GetDownloadState() != DS_WAITCALLBACK &&
+					cur_src->GetDownloadState() != DS_WAITCALLBACKKAD) {
+					// A server/source-exchange record with a UserHash can be probed safely: the
+					// origin hash is excluded above, and no part request is sent until a later
+					// policy check permits that peer.
+					cur_src->TryToConnect(true);
+					probedRelayCandidate = true;
+				} else if (cur_src->GetUserName().IsEmpty() &&
+					(cur_src->GetDownloadState() == DS_CONNECTING ||
+						cur_src->GetDownloadState() == DS_WAITCALLBACK ||
+						cur_src->GetDownloadState() == DS_WAITCALLBACKKAD)) {
+					probedRelayCandidate = true;
+				}
+			}
+			if (!ForcePartSelection::CanRequestFromSource(
+					GetFileHash(), cur_src->GetUserHash())) {
 				continue;
 			}
 			switch (cur_src->GetDownloadState()) {
@@ -1765,6 +2098,38 @@ uint32 CPartFile::Process(uint8 m_icounter)
 			}
 			}
 		}
+		if (ForcePartSelection::ShouldSendSequenceJoin(GetFileHash(), dwCurTick)) {
+			const wxString join = CFormat("KRLY1|JOIN|%s|%u|%s") % GetFileHash().Encode() %
+				(ForcePartSelection::GetSequencePart() - 1) %
+				ForcePartSelection::GetSequenceOrigin().Encode();
+			if (!theApp->clientlist->SendChatMessage(
+					ForcePartSelection::GetSequenceUpstreamCandidate(),
+					ForcePartSelection::GetSequenceUpstreamCandidateIP(),
+					ForcePartSelection::GetSequenceUpstreamCandidatePort(),
+					join)) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay JOIN could not be queued for upstream UserHash %s; will retry\n")) %
+					ForcePartSelection::GetSequenceUpstreamCandidate().Encode());
+			} else {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay JOIN queued for upstream '%s' (UserHash %s)\n")) %
+					ForcePartSelection::GetSequenceUpstreamName() %
+					ForcePartSelection::GetSequenceUpstreamCandidate().Encode());
+				if (ForcePartSelection::IsSequencePingPong() &&
+					ForcePartSelection::GetSequencePart() > 1) {
+					ForcePartSelection::BindSequenceUpstream(GetFileHash(),
+						ForcePartSelection::GetSequenceUpstreamCandidate(),
+						ForcePartSelection::GetSequenceUpstreamCandidateIP(),
+						ForcePartSelection::GetSequenceUpstreamCandidatePort());
+					if (ForcePartSelection::GetSequencePart() % 2 == 0) {
+						ForcePartSelection::BindSequenceDownstream(GetFileHash(),
+							ForcePartSelection::GetSequenceUpstreamCandidate(),
+							ForcePartSelection::GetSequenceUpstreamCandidateIP(),
+							ForcePartSelection::GetSequenceUpstreamCandidatePort());
+					}
+				}
+			}
+		}
 
 		/* eMule 0.30c implementation, i give it a try (Creteil) BEGIN ... */
 		if (IsA4AFAuto() && ((!m_LastNoNeededCheck) || (dwCurTick - m_LastNoNeededCheck > 900000))) {
@@ -1829,7 +2194,9 @@ uint32 CPartFile::Process(uint8 m_icounter)
 		// check if we want new sources from server
 		if (!m_localSrcReqQueued &&
 			((!m_lastsearchtime) || (dwCurTick - m_lastsearchtime) > SERVERREASKTIME) &&
-			theApp->IsConnectedED2K() && thePrefs::GetMaxSourcePerFileSoft() > GetSourceCount() &&
+			theApp->IsConnectedED2K() &&
+			(ForcePartSelection::IsSequenceByName() ||
+				thePrefs::GetMaxSourcePerFileSoft() > GetSourceCount()) &&
 			!m_stopped) {
 			m_localSrcReqQueued = true;
 			theApp->downloadqueue->SendLocalSrcRequest(this);
@@ -2226,8 +2593,7 @@ bool CPartFile::GetNextRequestedBlock(
 	while (newBlockCount != count) {
 		// Create a request block structure if a chunk has been previously selected
 		if (sender->GetLastPartAsked() != 0xffff) {
-			if (!ForcePartSelection::IsAllowed(GetFileHash(), sender->GetLastPartAsked()) ||
-				!ForcePartSelection::IsSourceAllowed(
+			if (!ForcePartSelection::IsDownloadAllowed(
 					GetFileHash(), sender->GetLastPartAsked(), sender->GetUserHash())) {
 				sender->SetLastPartAsked(0xffff);
 			} else {
@@ -2256,8 +2622,8 @@ bool CPartFile::GetNextRequestedBlock(
 			if (chunksList.empty()) {
 				// Identify the locally missing part(s) that this source has
 				for (uint16 i = 0; i < partCount; ++i) {
-					if (!ForcePartSelection::IsAllowed(GetFileHash(), i) ||
-						!ForcePartSelection::IsSourceAllowed(GetFileHash(), i, sender->GetUserHash())) {
+					if (!ForcePartSelection::IsDownloadAllowed(
+							GetFileHash(), i, sender->GetUserHash())) {
 						continue;
 					}
 					if (sender->IsPartAvailable(i) == true &&
@@ -2444,6 +2810,37 @@ void CPartFile::RemoveAllRequestedBlocks(void)
 
 void CPartFile::CompleteFile(bool bIsHashingDone)
 {
+	// Send the final relay notification only after the full-file hash has completed.
+	// This is the last point where the file is still in the download queue, and the
+	// successful hash confirms that the final part is complete and safe to serve.
+	if (bIsHashingDone && ForcePartSelection::IsSequencePingPong() &&
+		ForcePartSelection::IsSequenceConfigured(GetFileHash()) && GetPartCount() > 0 &&
+		ForcePartSelection::GetSequencePart() + 1 == GetPartCount()) {
+		const uint32 finalStep = ForcePartSelection::GetSequencePart();
+		const uint32 finalPart = ForcePartSelection::GetSequenceFilePart(GetPartCount(), finalStep);
+		const CMD4Hash &pairedPeer = ForcePartSelection::GetSequenceBackfillPeer();
+		if (pairedPeer.IsEmpty()) {
+			AddLogLineNS(CFormat(LOG_PRELOCALE(
+				"Relay final backfill part %u has no bound paired peer; completing file anyway\n")) %
+				finalPart);
+		} else {
+			const wxString backfill = CFormat("KRLY1|BACKFILL|%s|%u") %
+				GetFileHash().Encode() % finalStep;
+			if (theApp->clientlist->SendChatMessage(
+					pairedPeer,
+					ForcePartSelection::GetSequenceBackfillPeerIP(),
+					ForcePartSelection::GetSequenceBackfillPeerPort(),
+					backfill)) {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay final backfill part %u announced to paired node before file completion\n")) %
+					finalPart);
+			} else {
+				AddLogLineNS(CFormat(LOG_PRELOCALE(
+					"Relay final backfill part %u could not be announced to paired node; completing file anyway\n")) %
+					finalPart);
+			}
+		}
+	}
 	if (GetKadFileSearchID()) {
 		Kademlia::CSearchManager::StopSearch(GetKadFileSearchID(), false);
 	}
@@ -3412,7 +3809,8 @@ uint32 CPartFile::WriteToBuffer(uint32 transize,
 	m_lastDateChanged = wxDateTime::GetTimeNow();
 
 	// Create a new buffered queue entry
-	PartFileBufferedData *item = new PartFileBufferedData(m_hpartfile, data, start, end, block);
+	PartFileBufferedData *item =
+			new PartFileBufferedData(m_hpartfile, data, start, end, block, client->GetUserHash());
 
 	// Add to the queue in the correct position (most likely the end)
 	bool added = false;
@@ -3440,6 +3838,9 @@ uint32 CPartFile::WriteToBuffer(uint32 transize,
 	m_nTotalBufferData += lenData;
 
 	// Mark this small section of the file as filled
+	if (m_changedPartVerified.size() != GetPartCount()) {
+		m_changedPartVerified.resize(GetPartCount(), false);
+	}
 	FillGap(item->start, item->end);
 
 	// Update the flushed mark on the requested block
@@ -3471,8 +3872,14 @@ void CPartFile::FlushBuffer(bool fromAICHRecoveryDataAvailable)
 	if (m_aChangedPart.size() != partCount) {
 		m_aChangedPart.resize(partCount, false);
 	}
+        if (m_changedPartSource.size() != partCount) {
+                m_changedPartSource.resize(partCount);
+        }
+        if (m_changedPartVerified.size() != partCount) {
+                m_changedPartVerified.resize(partCount, false);
+        }
 
-	// No empty-buffer early-return: Phase 3 below still needs to run when m_aChangedPart has
+        // No empty-buffer early-return:
 	// dirty entries left from earlier writes (e.g. paused/idle download). Phase 1+2 are
 	// no-ops on an empty list.
 	if (!m_BufferedData_list.empty()) {
@@ -3519,6 +3926,8 @@ void CPartFile::FlushBuffer(bool fromAICHRecoveryDataAvailable)
 					++curpart) {
 					wxASSERT(curpart < partCount);
 					m_aChangedPart[curpart] = true;
+					m_changedPartSource[curpart] = item->userHash;
+                                        m_changedPartVerified[curpart] = false;
 				}
 				try {
 					{
@@ -3562,6 +3971,8 @@ void CPartFile::FlushBuffer(bool fromAICHRecoveryDataAvailable)
 					++curpart) {
 					wxASSERT(curpart < partCount);
 					m_aChangedPart[curpart] = true;
+					m_changedPartSource[curpart] = item->userHash;
+                                        m_changedPartVerified[curpart] = false;
 				}
 				m_nTotalBufferData -= lenData;
 				// m_iWrites already decremented by the write thread
@@ -3721,6 +4132,8 @@ void CPartFile::FlushBuffer(bool fromAICHRecoveryDataAvailable)
 				++curpart) {
 				wxASSERT(curpart < partCount);
 				m_aChangedPart[curpart] = true;
+					m_changedPartSource[curpart] = item->userHash;
+                                        m_changedPartVerified[curpart] = false;
 			}
 			m_nTotalBufferData -= lenData;
 			delete item;
@@ -3775,6 +4188,7 @@ void CPartFile::OnAsyncHashComplete(uint16 partNumber, bool ok, bool fromAICHRec
 
 	if (IsComplete(partNumber)) {
 		if (!ok) {
+                        m_changedPartVerified[partNumber] = false;
 			AddLogLineC(CFormat(_("Downloaded part %i is corrupt in file: %s")) % partNumber %
 				    GetFileName());
 			AddGap(partNumber);
@@ -3793,6 +4207,7 @@ void CPartFile::OnAsyncHashComplete(uint16 partNumber, bool ok, bool fromAICHRec
 				AddDebugLogLineN(logPartFile,
 					CFormat("Finished part %u of '%s'") % partNumber % GetFileName());
 			}
+                        m_changedPartVerified[partNumber] = true;
 
 			m_CorruptionBlackBox->VerifiedData(true, partNumber, 0, partRange);
 
@@ -3815,6 +4230,7 @@ void CPartFile::OnAsyncHashComplete(uint16 partNumber, bool ok, bool fromAICHRec
 	} else if (IsCorruptedPart(partNumber) &&
 		   (thePrefs::IsICHEnabled() || fromAICHRecoveryDataAvailable)) {
 		if (ok) {
+                        m_changedPartVerified[partNumber] = true;
 			++m_iTotalPacketsSavedDueToICH;
 			uint64 uMissingInPart = m_gaplist.GetGapSize(partNumber);
 			FillGap(partNumber);
